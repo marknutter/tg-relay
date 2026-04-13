@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "bun",
+      "args": ["/Users/marknutter/Kode/tg-relay/src/plugin.ts"]
+    }
+  }
+}

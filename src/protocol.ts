@@ -34,7 +34,13 @@ export type InboundPermissionRequest = {
   input_preview: string
 }
 
-export type DaemonToPlugin = InboundMessage | InboundPermissionRequest
+export type PermissionDecision = {
+  type: 'permission_decision'
+  request_id: string
+  behavior: 'allow' | 'deny'
+}
+
+export type DaemonToPlugin = InboundMessage | InboundPermissionRequest | PermissionDecision
 
 // ── Plugin → Daemon (outbound) ───────────────────────────────────────────
 
@@ -79,12 +85,21 @@ export type OutboundPermissionReply = {
   behavior: 'allow' | 'deny'
 }
 
+export type ForwardPermissionRequest = {
+  type: 'forward_permission_request'
+  request_id: string
+  tool_name: string
+  description: string
+  input_preview: string
+}
+
 export type PluginToDaemon =
   | OutboundReply
   | OutboundReact
   | OutboundEdit
   | OutboundDownload
   | OutboundPermissionReply
+  | ForwardPermissionRequest
 
 // ── Control messages (bidirectional) ─────────────────────────────────────
 
