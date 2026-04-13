@@ -7,6 +7,7 @@ PLIST_SRC="$SCRIPT_DIR/$PLIST_NAME.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 PLUGIN_ENTRY="$SCRIPT_DIR/src/plugin.ts"
 BUN="$(command -v bun || echo /opt/homebrew/bin/bun)"
+CACHED_PLUGIN="$HOME/.claude/plugins/cache/claude-plugins-official/telegram"
 
 echo "tg-relay installer"
 echo "=================="
@@ -43,35 +44,69 @@ launchctl load "$PLIST_DST"
 echo "   Installed and loaded: $PLIST_DST"
 echo "   Daemon will auto-start on boot and restart on crash."
 
-# 2. Register MCP plugin
+# 2. Hijack the built-in telegram plugin to run tg-relay
+# Claude Code only delivers channel notifications to servers named in --channels.
+# The internal server name is "plugin:telegram:telegram", which comes from the
+# built-in plugin system. We can't register a custom channel server — so we
+# redirect the built-in plugin's .mcp.json to run our plugin.ts instead.
 echo ""
-echo "2. Registering MCP plugin..."
+echo "2. Configuring plugin..."
 
-# Remove if already registered (to update the path)
-claude mcp remove tg-relay 2>/dev/null || true
-claude mcp add tg-relay --scope user -- "$BUN" "$PLUGIN_ENTRY"
-echo "   Registered: claude mcp add tg-relay --scope user -- $BUN $PLUGIN_ENTRY"
-
-# 3. Optionally disable built-in telegram plugin
-echo ""
-echo "3. Built-in Telegram plugin"
-if claude mcp list 2>/dev/null | grep -q "plugin:telegram:telegram"; then
-  echo "   The built-in telegram plugin is currently active."
-  read -rp "   Disable it? (recommended to avoid conflicts) [Y/n] " answer
-  answer="${answer:-Y}"
-  if [[ "$answer" =~ ^[Yy] ]]; then
-    claude mcp remove "plugin:telegram:telegram" 2>/dev/null || true
-    echo "   Disabled built-in telegram plugin."
-  else
-    echo "   Kept built-in telegram plugin (may conflict with tg-relay)."
+LATEST_VERSION=$(ls -v "$CACHED_PLUGIN" 2>/dev/null | tail -1)
+if [ -n "$LATEST_VERSION" ]; then
+  MCP_JSON="$CACHED_PLUGIN/$LATEST_VERSION/.mcp.json"
+  if [ -f "$MCP_JSON" ]; then
+    # Backup original if not already backed up
+    if [ ! -f "$MCP_JSON.bak" ]; then
+      cp "$MCP_JSON" "$MCP_JSON.bak"
+    fi
+    cat > "$MCP_JSON" << EOF
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "$BUN",
+      "args": ["$PLUGIN_ENTRY"]
+    }
+  }
+}
+EOF
+    echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
   fi
 else
-  echo "   Built-in telegram plugin not found (already disabled or not installed)."
+  echo "   Warning: built-in telegram plugin not found in cache."
+  echo "   Make sure telegram@claude-plugins-official is installed."
 fi
+
+# 3. Disable the official plugin in settings (our code runs via the hijacked .mcp.json)
+echo ""
+echo "3. Configuring settings..."
+
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+  python3 -c "
+import json
+with open('$SETTINGS') as f:
+    data = json.load(f)
+# Enable the plugin (so .mcp.json is loaded) but our code runs instead
+data.setdefault('enabledPlugins', {})['telegram@claude-plugins-official'] = True
+with open('$SETTINGS', 'w') as f:
+    json.dump(data, f, indent=4)
+" 2>/dev/null && echo "   Enabled telegram plugin in settings (runs tg-relay code)."
+fi
+
+# 4. Set up shell alias
+echo ""
+echo "4. Shell alias"
+echo ""
+echo "   Add this to your ~/.zshrc (or equivalent):"
+echo ""
+echo '   alias claude!="claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official"'
+echo ""
+echo "   The --channels flag is required for Claude Code to accept channel notifications."
 
 echo ""
 echo "Done! The daemon is now polling all configured bots at:"
 echo "  ~/.claude/channels/telegram-*/"
 echo ""
-echo "New Claude Code sessions will automatically connect via the tg-relay plugin."
-echo "Check daemon logs: tail -f ~/.claude/channels/telegram-router.log"
+echo "Start a session with: claude! (from any project directory)"
+echo "Check daemon logs:    tail -f ~/.claude/channels/telegram-router.log"

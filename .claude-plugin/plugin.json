@@ -1,0 +1,11 @@
+{
+  "name": "telegram",
+  "description": "Telegram channel for Claude Code via tg-relay daemon. Decouples polling from session lifecycle.",
+  "version": "2.0.0",
+  "keywords": [
+    "telegram",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}

@@ -22,7 +22,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { existsSync, readdirSync, realpathSync, readFileSync, statSync, appendFileSync, mkdirSync } from 'fs'
+import { existsSync, readdirSync, realpathSync, readFileSync, statSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, sep, basename } from 'path'
 import { execFileSync } from 'child_process'
@@ -41,13 +41,6 @@ const CHANNELS_ROOT = join(HOME, '.claude', 'channels')
 const MAX_CHUNK_LIMIT = 4096
 const RECONNECT_BASE = 1000
 const RECONNECT_MAX = 30000
-const DEBUG_LOG = join(CHANNELS_ROOT, 'tg-relay-plugin.log')
-
-function debugLog(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${msg}\n`
-  process.stderr.write(line)
-  try { appendFileSync(DEBUG_LOG, line) } catch {}
-}
 
 // ── Resolve channel from Claude Code's cwd ──────────────────────────────────
 
@@ -402,7 +395,6 @@ function handleDaemonMessage(raw: string): void {
 
     case 'message': {
       const msg = parsed as InboundMessage
-      debugLog(`received inbound: from=${msg.user} text=${msg.text.slice(0, 80)}`)
       const meta: Record<string, string> = {
         chat_id: msg.chat_id,
         user: msg.user,
@@ -419,17 +411,14 @@ function handleDaemonMessage(raw: string): void {
         if (msg.attachment.name) meta.attachment_name = msg.attachment.name
       }
 
-      debugLog(`emitting notification: method=notifications/claude/channel content=${msg.text.slice(0, 40)} meta=${JSON.stringify(meta)}`)
-      mcp.notification({
+      void mcp.notification({
         method: 'notifications/claude/channel',
         params: {
           content: msg.text,
           meta,
         },
-      }).then(() => {
-        debugLog(`notification emitted successfully`)
       }).catch(err => {
-        debugLog(`notification FAILED: ${err}`)
+        process.stderr.write(`tg-relay plugin: failed to emit notification: ${err}\n`)
       })
       break
     }
