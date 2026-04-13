@@ -1,12 +1,12 @@
 /**
  * Channel directory discovery.
  *
- * Scans ~/.claude/channels/telegram-*/ for configured bots.
+ * Scans ~/.claude/channels/telegram-{name}/ for configured bots.
  * Each directory with a valid .env containing TELEGRAM_BOT_TOKEN is a channel.
  */
 
 import { readdirSync, readFileSync, existsSync } from 'fs'
-import { join, basename } from 'path'
+import { join, basename, resolve } from 'path'
 import { homedir } from 'os'
 
 export type ChannelConfig = {
@@ -78,7 +78,7 @@ export function resolveChannelName(claudeCodeCwd: string): string | undefined {
       break
     }
     const parent = join(dir, '..')
-    const resolved = require('path').resolve(parent)
+    const resolved = resolve(parent)
     if (resolved === dir) break
     dir = resolved
   }
