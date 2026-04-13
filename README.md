@@ -32,19 +32,51 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 ```bash
 cd ~/Kode/tg-relay
 bun install
-
-# Install launchd service (auto-starts on boot, auto-restarts on crash)
-cp com.marknutter.tg-relay.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.marknutter.tg-relay.plist
-
-# Register the thin plugin as Claude Code's Telegram MCP server
-claude mcp remove plugin:telegram:telegram 2>/dev/null
-claude mcp add tg-relay-plugin --scope user -- bun /Users/marknutter/Kode/tg-relay/src/plugin.ts
+./install.sh
 ```
+
+The install script:
+1. Loads the daemon via launchd (auto-starts on boot, auto-restarts on crash)
+2. Redirects the built-in telegram plugin to run tg-relay's `plugin.ts`
+3. Enables the plugin in Claude Code settings
+
+Then add this alias to your `~/.zshrc`:
+
+```bash
+alias claude!="claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official"
+```
+
+The `--channels` flag is required — without it, Claude Code silently drops channel notifications.
 
 ## Usage
 
-Once installed, `claude!` from any project directory auto-connects to the right bot via the daemon. No `TELEGRAM_STATE_DIR` env var needed — the plugin resolves the channel from Claude Code's cwd (same `.claude-channel` file or directory basename matching).
+Once installed, `claude!` from any project directory auto-connects to the right bot via the daemon. No env vars needed — the plugin resolves the channel from Claude Code's cwd.
+
+### Adding a new project
+
+If your project directory name matches the channel name (e.g. `~/Kode/myproject` and `telegram-myproject`):
+
+```bash
+claude-channel-add myproject <BOT_TOKEN>
+# Wait ~30s for the daemon to discover it, then:
+cd ~/Kode/myproject
+claude!
+```
+
+If your directory name doesn't match, drop a `.claude-channel` file in the project root:
+
+```bash
+echo "mybot" > ~/Kode/some-other-name/.claude-channel
+claude-channel-add mybot <BOT_TOKEN>
+```
+
+The daemon picks up new channels automatically — no restart needed.
+
+### Channel resolution order
+
+1. Walk up from project root looking for a `.claude-channel` file
+2. Match directory basename against `~/.claude/channels/telegram-{name}/`
+3. Fall back to `main` if no match found
 
 ## Environment Variables
 
