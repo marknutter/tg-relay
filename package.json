@@ -1,0 +1,18 @@
+{
+  "name": "tg-relay",
+  "version": "0.1.0",
+  "description": "Long-lived Telegram polling daemon + thin MCP client for Claude Code. Decouples Telegram delivery from session lifecycle.",
+  "type": "module",
+  "scripts": {
+    "daemon": "bun src/daemon.ts",
+    "plugin": "bun src/plugin.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0",
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.8.0"
+  }
+}
