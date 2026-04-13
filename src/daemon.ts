@@ -52,6 +52,9 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 function log(channel: string, msg: string): void {
   const line = `[${new Date().toISOString()}] [${channel}] ${msg}\n`
   process.stderr.write(line)
+  // Under launchd, stderr already goes to the log file — don't double-write.
+  // Only appendFileSync when running interactively (stderr is a TTY).
+  if (!process.stderr.isTTY) return
   try { appendFileSync(LOG_FILE, line) } catch {}
 }
 
