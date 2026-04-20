@@ -30,7 +30,7 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 ## Setup
 
 ```bash
-cd ~/Kode/tg-relay
+cd ~/Code/tg-relay
 bun install
 ./install.sh
 ```
@@ -54,19 +54,19 @@ Once installed, `claude!` from any project directory auto-connects to the right 
 
 ### Adding a new project
 
-If your project directory name matches the channel name (e.g. `~/Kode/myproject` and `telegram-myproject`):
+If your project directory name matches the channel name (e.g. `~/Code/myproject` and `telegram-myproject`):
 
 ```bash
 claude-channel-add myproject <BOT_TOKEN>
 # Wait ~30s for the daemon to discover it, then:
-cd ~/Kode/myproject
+cd ~/Code/myproject
 claude!
 ```
 
 If your directory name doesn't match, drop a `.claude-channel` file in the project root:
 
 ```bash
-echo "mybot" > ~/Kode/some-other-name/.claude-channel
+echo "mybot" > ~/Code/some-other-name/.claude-channel
 claude-channel-add mybot <BOT_TOKEN>
 ```
 

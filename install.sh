@@ -3,34 +3,34 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_NAME="com.marknutter.tg-relay"
-PLIST_SRC="$SCRIPT_DIR/$PLIST_NAME.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 PLUGIN_ENTRY="$SCRIPT_DIR/src/plugin.ts"
-BUN="$(command -v bun || echo /opt/homebrew/bin/bun)"
+DAEMON_ENTRY="$SCRIPT_DIR/src/daemon.ts"
+BUN="$(command -v bun || true)"
 CACHED_PLUGIN="$HOME/.claude/plugins/cache/claude-plugins-official/telegram"
+LOG_FILE="$HOME/.claude/channels/telegram-router.log"
 
 echo "tg-relay installer"
 echo "=================="
 echo ""
 
 # Check prerequisites
-if [ ! -x "$BUN" ]; then
-  echo "Error: bun not found. Install from https://bun.sh"
+if [ -z "$BUN" ] || [ ! -x "$BUN" ]; then
+  echo "Error: bun not found on PATH. Install from https://bun.sh"
   exit 1
 fi
-
-if [ ! -f "$PLIST_SRC" ]; then
-  echo "Error: $PLIST_SRC not found. Run from the tg-relay repo root."
-  exit 1
-fi
+echo "Using bun at: $BUN"
 
 # Install dependencies if needed
 if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
   echo "Installing dependencies..."
-  (cd "$SCRIPT_DIR" && bun install)
+  (cd "$SCRIPT_DIR" && "$BUN" install)
 fi
 
-# 1. Install launchd service
+# Ensure log file's parent dir exists (launchd doesn't create it)
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# 1. Generate and install launchd service
 echo ""
 echo "1. Installing launchd service..."
 
@@ -39,7 +39,39 @@ if launchctl list "$PLIST_NAME" &>/dev/null; then
   launchctl unload "$PLIST_DST" 2>/dev/null || true
 fi
 
-cp "$PLIST_SRC" "$PLIST_DST"
+mkdir -p "$(dirname "$PLIST_DST")"
+cat > "$PLIST_DST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$PLIST_NAME</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BUN</string>
+    <string>$DAEMON_ENTRY</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOG_FILE</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_FILE</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$HOME</string>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
+EOF
+
 launchctl load "$PLIST_DST"
 echo "   Installed and loaded: $PLIST_DST"
 echo "   Daemon will auto-start on boot and restart on crash."
@@ -53,13 +85,14 @@ echo ""
 echo "2. Configuring plugin..."
 
 LATEST_VERSION=$(ls -v "$CACHED_PLUGIN" 2>/dev/null | tail -1)
-if [ -n "$LATEST_VERSION" ]; then
-  MCP_JSON="$CACHED_PLUGIN/$LATEST_VERSION/.mcp.json"
+if [ -z "$LATEST_VERSION" ]; then
+  echo "   Warning: built-in telegram plugin not found in cache."
+  echo "   Make sure telegram@claude-plugins-official is installed."
+else
+  PLUGIN_ROOT="$CACHED_PLUGIN/$LATEST_VERSION"
+  MCP_JSON="$PLUGIN_ROOT/.mcp.json"
   if [ -f "$MCP_JSON" ]; then
-    # Backup original if not already backed up
-    if [ ! -f "$MCP_JSON.bak" ]; then
-      cp "$MCP_JSON" "$MCP_JSON.bak"
-    fi
+    [ -f "$MCP_JSON.bak" ] || cp "$MCP_JSON" "$MCP_JSON.bak"
     cat > "$MCP_JSON" << EOF
 {
   "mcpServers": {
@@ -72,9 +105,19 @@ if [ -n "$LATEST_VERSION" ]; then
 EOF
     echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
   fi
-else
-  echo "   Warning: built-in telegram plugin not found in cache."
-  echo "   Make sure telegram@claude-plugins-official is installed."
+
+  # 2b. Hijack the cached skills so /telegram:access and /telegram:configure
+  # use per-channel state dirs (telegram-{name}/) instead of the upstream's
+  # single hardcoded ~/.claude/channels/telegram/ path.
+  for SKILL in access configure; do
+    DST_SKILL="$PLUGIN_ROOT/skills/$SKILL/SKILL.md"
+    SRC_SKILL="$SCRIPT_DIR/skills/$SKILL/SKILL.md"
+    if [ -f "$DST_SKILL" ] && [ -f "$SRC_SKILL" ]; then
+      [ -f "$DST_SKILL.bak" ] || cp "$DST_SKILL" "$DST_SKILL.bak"
+      cp "$SRC_SKILL" "$DST_SKILL"
+      echo "   Patched $DST_SKILL"
+    fi
+  done
 fi
 
 # 3. Disable the official plugin in settings (our code runs via the hijacked .mcp.json)
@@ -109,4 +152,4 @@ echo "Done! The daemon is now polling all configured bots at:"
 echo "  ~/.claude/channels/telegram-*/"
 echo ""
 echo "Start a session with: claude! (from any project directory)"
-echo "Check daemon logs:    tail -f ~/.claude/channels/telegram-router.log"
+echo "Check daemon logs:    tail -f $LOG_FILE"
