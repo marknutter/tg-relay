@@ -26,6 +26,7 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
+import { transcribeAudio } from './transcribe.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -681,7 +682,36 @@ function setupInboundHandlers(state: ChannelState): void {
 
   bot.on('message:voice', async ctx => {
     const voice = ctx.message.voice
-    const text = ctx.message.caption ?? '(voice message)'
+    let text = ctx.message.caption ?? '(voice message)'
+
+    // Download and transcribe. If either fails, fall back to the placeholder.
+    try {
+      const file = await ctx.api.getFile(voice.file_id)
+      if (file.file_path) {
+        const token = config.botToken
+        const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`
+        const res = await fetch(url)
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer())
+          const ext = file.file_path.split('.').pop() ?? 'ogg'
+          const inboxDir = join(stateDir, 'inbox')
+          const audioPath = join(inboxDir, `${Date.now()}-${voice.file_unique_id}.${ext}`)
+          mkdirSync(inboxDir, { recursive: true })
+          writeFileSync(audioPath, buf)
+
+          const transcription = await transcribeAudio(audioPath)
+          if (transcription) {
+            text = transcription
+            log(channelName, `transcribed voice (${buf.length} bytes): ${transcription.slice(0, 80)}`)
+          } else {
+            log(channelName, `voice transcription failed, using placeholder`)
+          }
+        }
+      }
+    } catch (err) {
+      log(channelName, `voice download/transcribe error: ${err}`)
+    }
+
     await handleInbound(ctx, text, undefined, {
       kind: 'voice',
       file_id: voice.file_id,
