@@ -27,6 +27,7 @@ import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
 import { transcribeAudio } from './transcribe.js'
+import { synthesizeVoice } from './synthesize.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -376,6 +377,28 @@ async function handlePluginMessage(state: ChannelState, raw: string): Promise<vo
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
+
+        // Voice reply path: try synthesis first, fall back to text on any failure.
+        if (msg.voice) {
+          const oggPath = await synthesizeVoice(msg.text, state.config.name)
+          if (oggPath) {
+            try {
+              await state.bot.api.sendVoice(msg.chat_id, new InputFile(oggPath), {
+                ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
+              })
+              log(state.config.name, `voice reply sent to chat ${msg.chat_id} (${msg.text.length} chars)`)
+              try { rmSync(oggPath, { force: true }) } catch {}
+              break
+            } catch (err) {
+              try { rmSync(oggPath, { force: true }) } catch {}
+              log(state.config.name, `sendVoice failed, falling back to text: ${err}`)
+            }
+          } else {
+            log(state.config.name, `voice synthesis unavailable, falling back to text`)
+          }
+          // fall through to text reply below
+        }
+
         const chunks = chunk(msg.text, limit, mode)
 
         for (let i = 0; i < chunks.length; i++) {
