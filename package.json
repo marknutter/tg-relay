@@ -8,8 +8,9 @@
     "plugin": "bun src/plugin.ts"
   },
   "dependencies": {
-    "grammy": "^1.35.0",
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "croner": "^10.0.1",
+    "grammy": "^1.35.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

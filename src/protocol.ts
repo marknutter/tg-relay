@@ -24,6 +24,10 @@ export type InboundMessage = {
     mime?: string
     name?: string
   }
+  /** Present when this is a scheduled prompt from the daemon, not a real user message. */
+  heartbeat?: {
+    name: string
+  }
 }
 
 export type InboundPermissionRequest = {

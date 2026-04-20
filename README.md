@@ -87,6 +87,37 @@ The daemon picks up new channels automatically — no restart needed.
 2. Match directory basename against `~/.claude/channels/telegram-{name}/`
 3. If neither matches, the plugin runs but stays unconfigured — Telegram tools return an error and no socket connection is made. This keeps utility sessions (home directory, unrelated repos) from squatting on a channel.
 
+### Scheduled heartbeats
+
+Define recurring prompts for a channel in `~/.claude/channels/telegram-<name>/heartbeats.json`. When the cron fires AND a Claude Code session is connected to that channel, the daemon injects the prompt as a synthetic channel notification. Claude executes the instruction and can reply via Telegram per its usual rubric.
+
+```jsonc
+// ~/.claude/channels/telegram-eve/heartbeats.json
+[
+  {
+    "name": "morning-summary",
+    "cron": "0 8 * * *",
+    "prompt": "Summarize any CI failures overnight and message me via telegram."
+  },
+  {
+    "name": "queue-check",
+    "cron": "*/30 * * * *",
+    "prompt": "Check the deploy queue. Only ping me if anything's stuck.",
+    "enabled": true
+  }
+]
+```
+
+Behavior:
+- The daemon reloads `heartbeats.json` on each rescan (default 30s) — no restart needed
+- If no plugin is connected when the cron fires, the heartbeat is **skipped** (not buffered). Stale scheduled prompts aren't useful; the next tick will fire
+- Replies route to `access.allowFrom[0]`. If the allowlist is empty, the heartbeat is skipped
+- Claude sees `heartbeat="true"` and `heartbeat_name="..."` on the inbound `<channel>` tag and knows to execute autonomously (not converse)
+- Invalid cron expressions or missing fields are logged and skipped; other heartbeats continue working
+- Set `"enabled": false` to disable a specific heartbeat without deleting it
+
+For heartbeats that must survive session closes, keep the session alive in tmux (or a launchd wrapper). The daemon itself runs 24/7 under launchd already, but heartbeats still require a session to inject into.
+
 ## Environment Variables
 
 | Variable | Description | Default |
