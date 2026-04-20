@@ -84,16 +84,20 @@ echo "   Daemon will auto-start on boot and restart on crash."
 echo ""
 echo "2. Configuring plugin..."
 
-LATEST_VERSION=$(ls -v "$CACHED_PLUGIN" 2>/dev/null | tail -1)
-if [ -z "$LATEST_VERSION" ]; then
-  echo "   Warning: built-in telegram plugin not found in cache."
-  echo "   Make sure telegram@claude-plugins-official is installed."
-else
-  PLUGIN_ROOT="$CACHED_PLUGIN/$LATEST_VERSION"
-  MCP_JSON="$PLUGIN_ROOT/.mcp.json"
-  if [ -f "$MCP_JSON" ]; then
-    [ -f "$MCP_JSON.bak" ] || cp "$MCP_JSON" "$MCP_JSON.bak"
-    cat > "$MCP_JSON" << EOF
+# Hijack EVERY cached version, not just the latest. Claude Code may auto-update
+# the plugin at any time, and any existing Claude sessions keep running against
+# their original version. If an un-hijacked version is loaded, it'll poll the
+# bot token directly and cause 409 Conflict fights with the daemon.
+HIJACKED=0
+if [ -d "$CACHED_PLUGIN" ]; then
+  for version_dir in "$CACHED_PLUGIN"/*/; do
+    [ -d "$version_dir" ] || continue
+    MCP_JSON="$version_dir/.mcp.json"
+    if [ -f "$MCP_JSON" ]; then
+      if [ ! -f "$MCP_JSON.bak" ]; then
+        cp "$MCP_JSON" "$MCP_JSON.bak"
+      fi
+      cat > "$MCP_JSON" << EOF
 {
   "mcpServers": {
     "telegram": {
@@ -103,21 +107,30 @@ else
   }
 }
 EOF
-    echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
-  fi
-
-  # 2b. Hijack the cached skills so /telegram:access and /telegram:configure
-  # use per-channel state dirs (telegram-{name}/) instead of the upstream's
-  # single hardcoded ~/.claude/channels/telegram/ path.
-  for SKILL in access configure; do
-    DST_SKILL="$PLUGIN_ROOT/skills/$SKILL/SKILL.md"
-    SRC_SKILL="$SCRIPT_DIR/skills/$SKILL/SKILL.md"
-    if [ -f "$DST_SKILL" ] && [ -f "$SRC_SKILL" ]; then
-      [ -f "$DST_SKILL.bak" ] || cp "$DST_SKILL" "$DST_SKILL.bak"
-      cp "$SRC_SKILL" "$DST_SKILL"
-      echo "   Patched $DST_SKILL"
+      echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
+      HIJACKED=$((HIJACKED + 1))
     fi
+
+    # Also hijack the cached skills so /telegram:access and /telegram:configure
+    # use per-channel state dirs (telegram-{name}/) instead of the upstream's
+    # single hardcoded ~/.claude/channels/telegram/ path.
+    for SKILL in access configure; do
+      DST_SKILL="$version_dir/skills/$SKILL/SKILL.md"
+      SRC_SKILL="$SCRIPT_DIR/skills/$SKILL/SKILL.md"
+      if [ -f "$DST_SKILL" ] && [ -f "$SRC_SKILL" ]; then
+        [ -f "$DST_SKILL.bak" ] || cp "$DST_SKILL" "$DST_SKILL.bak"
+        cp "$SRC_SKILL" "$DST_SKILL"
+        echo "   Patched $DST_SKILL"
+      fi
+    done
   done
+fi
+
+if [ "$HIJACKED" -eq 0 ]; then
+  echo "   Warning: built-in telegram plugin not found in cache."
+  echo "   Make sure telegram@claude-plugins-official is installed."
+else
+  echo "   Hijacked $HIJACKED cached version(s)."
 fi
 
 # 3. Disable the official plugin in settings (our code runs via the hijacked .mcp.json)

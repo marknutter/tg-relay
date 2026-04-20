@@ -45,6 +45,23 @@ const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// Where the built-in telegram plugin's cached versions live. We re-hijack on
+// each rescan so that Claude Code auto-updating the plugin doesn't silently
+// restore the original server.ts (which would then fight the daemon for the
+// bot-token polling slot).
+const PLUGIN_CACHE_DIR = join(HOME, '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram')
+const PLUGIN_ENTRY = join(import.meta.dir ?? '.', 'plugin.ts')
+const REPO_SKILLS_DIR = join(import.meta.dir ?? '.', '..', 'skills')
+const HIJACKED_SKILLS = ['access', 'configure']
+const HIJACK_JSON = JSON.stringify({
+  mcpServers: {
+    telegram: {
+      command: process.execPath,
+      args: [PLUGIN_ENTRY],
+    },
+  },
+}, null, 2)
+
 // Permission-reply regex from anthropics/claude-cli-internal
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
@@ -937,9 +954,72 @@ async function stopChannel(name: string): Promise<void> {
   log(name, 'channel stopped')
 }
 
+// ── Plugin hijack maintenance ───────────────────────────────────────────────
+
+// Re-apply the .mcp.json hijack to every cached plugin version. Claude Code
+// auto-updates plugins in the background, and any un-hijacked version will
+// poll Telegram directly and cause 409 Conflict storms for the daemon.
+function ensurePluginHijack(): void {
+  let entries: string[]
+  try { entries = readdirSync(PLUGIN_CACHE_DIR) } catch { return }
+
+  for (const version of entries) {
+    const versionDir = join(PLUGIN_CACHE_DIR, version)
+
+    // Hijack .mcp.json (server entrypoint)
+    const mcpJson = join(versionDir, '.mcp.json')
+    if (existsSync(mcpJson)) {
+      let current = ''
+      try { current = readFileSync(mcpJson, 'utf8') } catch {}
+
+      if (!current.includes(PLUGIN_ENTRY)) {
+        const backup = `${mcpJson}.bak`
+        if (!existsSync(backup) && current) {
+          try { writeFileSync(backup, current) } catch {}
+        }
+        try {
+          writeFileSync(mcpJson, HIJACK_JSON + '\n')
+          logGlobal(`hijacked plugin v${version} -> ${PLUGIN_ENTRY}`)
+        } catch (err) {
+          logGlobal(`failed to hijack plugin v${version}: ${err}`)
+        }
+      }
+    }
+
+    // Hijack skills (access, configure) — upstream hardcodes
+    // ~/.claude/channels/telegram/, ours resolves per-channel
+    for (const skill of HIJACKED_SKILLS) {
+      const dst = join(versionDir, 'skills', skill, 'SKILL.md')
+      const src = join(REPO_SKILLS_DIR, skill, 'SKILL.md')
+      if (!existsSync(dst) || !existsSync(src)) continue
+
+      let srcContent = '', dstContent = ''
+      try {
+        srcContent = readFileSync(src, 'utf8')
+        dstContent = readFileSync(dst, 'utf8')
+      } catch { continue }
+
+      if (srcContent === dstContent) continue
+
+      const backup = `${dst}.bak`
+      if (!existsSync(backup)) {
+        try { writeFileSync(backup, dstContent) } catch {}
+      }
+      try {
+        writeFileSync(dst, srcContent)
+        logGlobal(`patched skill ${skill} in v${version}`)
+      } catch (err) {
+        logGlobal(`failed to patch skill ${skill} v${version}: ${err}`)
+      }
+    }
+  }
+}
+
 // ── Periodic channel rescan ─────────────────────────────────────────────────
 
 function rescanChannels(): void {
+  ensurePluginHijack()
+
   const discovered = discoverChannels()
   const discoveredNames = new Set(discovered.map(c => c.name))
 
@@ -990,6 +1070,8 @@ process.on('uncaughtException', err => {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 logGlobal(`starting (pid=${process.pid})`)
+
+ensurePluginHijack()
 
 const initialChannels = discoverChannels()
 logGlobal(`discovered ${initialChannels.length} channel(s): ${initialChannels.map(c => c.name).join(', ')}`)

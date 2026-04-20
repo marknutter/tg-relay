@@ -84,7 +84,7 @@ The daemon picks up new channels automatically — no restart needed.
 
 1. Walk up from project root looking for a `.claude-channel` file
 2. Match directory basename against `~/.claude/channels/telegram-{name}/`
-3. Fall back to `main` if no match found
+3. If neither matches, the plugin runs but stays unconfigured — Telegram tools return an error and no socket connection is made. This keeps utility sessions (home directory, unrelated repos) from squatting on a channel.
 
 ## Environment Variables
 
