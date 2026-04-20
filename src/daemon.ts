@@ -44,6 +44,21 @@ const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// Where the built-in telegram plugin's cached versions live. We re-hijack on
+// each rescan so that Claude Code auto-updating the plugin doesn't silently
+// restore the original server.ts (which would then fight the daemon for the
+// bot-token polling slot).
+const PLUGIN_CACHE_DIR = join(HOME, '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram')
+const PLUGIN_ENTRY = join(import.meta.dir ?? '.', 'plugin.ts')
+const HIJACK_JSON = JSON.stringify({
+  mcpServers: {
+    telegram: {
+      command: process.execPath,
+      args: [PLUGIN_ENTRY],
+    },
+  },
+}, null, 2)
+
 // Permission-reply regex from anthropics/claude-cli-internal
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
@@ -907,9 +922,45 @@ async function stopChannel(name: string): Promise<void> {
   log(name, 'channel stopped')
 }
 
+// ── Plugin hijack maintenance ───────────────────────────────────────────────
+
+// Re-apply the .mcp.json hijack to every cached plugin version. Claude Code
+// auto-updates plugins in the background, and any un-hijacked version will
+// poll Telegram directly and cause 409 Conflict storms for the daemon.
+function ensurePluginHijack(): void {
+  let entries: string[]
+  try { entries = readdirSync(PLUGIN_CACHE_DIR) } catch { return }
+
+  for (const version of entries) {
+    const mcpJson = join(PLUGIN_CACHE_DIR, version, '.mcp.json')
+    if (!existsSync(mcpJson)) continue
+
+    let current: string
+    try { current = readFileSync(mcpJson, 'utf8') } catch { continue }
+
+    // Skip if already hijacked (points to our plugin.ts)
+    if (current.includes(PLUGIN_ENTRY)) continue
+
+    // Backup original first time we see it
+    const backup = `${mcpJson}.bak`
+    if (!existsSync(backup)) {
+      try { writeFileSync(backup, current) } catch {}
+    }
+
+    try {
+      writeFileSync(mcpJson, HIJACK_JSON + '\n')
+      logGlobal(`hijacked plugin v${version} -> ${PLUGIN_ENTRY}`)
+    } catch (err) {
+      logGlobal(`failed to hijack plugin v${version}: ${err}`)
+    }
+  }
+}
+
 // ── Periodic channel rescan ─────────────────────────────────────────────────
 
 function rescanChannels(): void {
+  ensurePluginHijack()
+
   const discovered = discoverChannels()
   const discoveredNames = new Set(discovered.map(c => c.name))
 
@@ -960,6 +1011,8 @@ process.on('uncaughtException', err => {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 logGlobal(`starting (pid=${process.pid})`)
+
+ensurePluginHijack()
 
 const initialChannels = discoverChannels()
 logGlobal(`discovered ${initialChannels.length} channel(s): ${initialChannels.map(c => c.name).join(', ')}`)

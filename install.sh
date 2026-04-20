@@ -52,15 +52,20 @@ echo "   Daemon will auto-start on boot and restart on crash."
 echo ""
 echo "2. Configuring plugin..."
 
-LATEST_VERSION=$(ls -v "$CACHED_PLUGIN" 2>/dev/null | tail -1)
-if [ -n "$LATEST_VERSION" ]; then
-  MCP_JSON="$CACHED_PLUGIN/$LATEST_VERSION/.mcp.json"
-  if [ -f "$MCP_JSON" ]; then
-    # Backup original if not already backed up
-    if [ ! -f "$MCP_JSON.bak" ]; then
-      cp "$MCP_JSON" "$MCP_JSON.bak"
-    fi
-    cat > "$MCP_JSON" << EOF
+# Hijack EVERY cached version, not just the latest. Claude Code may auto-update
+# the plugin at any time, and any existing Claude sessions keep running against
+# their original version. If an un-hijacked version is loaded, it'll poll the
+# bot token directly and cause 409 Conflict fights with the daemon.
+HIJACKED=0
+if [ -d "$CACHED_PLUGIN" ]; then
+  for version_dir in "$CACHED_PLUGIN"/*/; do
+    [ -d "$version_dir" ] || continue
+    MCP_JSON="$version_dir/.mcp.json"
+    if [ -f "$MCP_JSON" ]; then
+      if [ ! -f "$MCP_JSON.bak" ]; then
+        cp "$MCP_JSON" "$MCP_JSON.bak"
+      fi
+      cat > "$MCP_JSON" << EOF
 {
   "mcpServers": {
     "telegram": {
@@ -70,11 +75,17 @@ if [ -n "$LATEST_VERSION" ]; then
   }
 }
 EOF
-    echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
-  fi
-else
+      echo "   Redirected $MCP_JSON -> $PLUGIN_ENTRY"
+      HIJACKED=$((HIJACKED + 1))
+    fi
+  done
+fi
+
+if [ "$HIJACKED" -eq 0 ]; then
   echo "   Warning: built-in telegram plugin not found in cache."
   echo "   Make sure telegram@claude-plugins-official is installed."
+else
+  echo "   Hijacked $HIJACKED cached version(s)."
 fi
 
 # 3. Disable the official plugin in settings (our code runs via the hijacked .mcp.json)

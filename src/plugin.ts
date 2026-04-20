@@ -22,7 +22,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { existsSync, readdirSync, realpathSync, readFileSync, statSync } from 'fs'
+import { existsSync, realpathSync, readFileSync, statSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, sep, basename } from 'path'
 import { execFileSync } from 'child_process'
@@ -97,21 +97,6 @@ function resolveChannelName(): string | undefined {
   return undefined
 }
 
-function resolveChannelNameWithFallback(): string {
-  const resolved = resolveChannelName()
-  if (resolved) return resolved
-
-  // Fallback: if only one channel exists, use it. Otherwise use "main" or first.
-  try {
-    const entries = readdirSync(CHANNELS_ROOT).filter(e => e.startsWith('telegram-'))
-    if (entries.length === 1) return entries[0].replace('telegram-', '')
-    const hasMain = entries.includes('telegram-main')
-    if (hasMain) return 'main'
-    if (entries.length > 0) return entries[0].replace('telegram-', '')
-  } catch {}
-
-  return 'main'
-}
 
 // ── File-send security ──────────────────────────────────────────────────────
 
@@ -150,11 +135,16 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
-const channelName = resolveChannelNameWithFallback()
-const stateDir = join(CHANNELS_ROOT, `telegram-${channelName}`)
-const socketPath = join(stateDir, 'session.sock')
+const channelName = resolveChannelName()
+const stateDir = channelName ? join(CHANNELS_ROOT, `telegram-${channelName}`) : null
+const socketPath = stateDir ? join(stateDir, 'session.sock') : null
 
-process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)
+if (channelName) {
+  process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)
+} else {
+  process.stderr.write(`tg-relay plugin: no channel matched for this session (no .claude-channel file, no basename match). ` +
+    `Running MCP server but skipping socket connection — Telegram tools will return an error if called.\n`)
+}
 
 const mcp = new Server(
   { name: 'telegram', version: '2.0.0' },
@@ -272,6 +262,14 @@ const pendingDownloads = new Map<string, {
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+
+  if (!channelName || !stateDir) {
+    return {
+      content: [{ type: 'text', text: `${req.params.name} failed: no Telegram channel configured for this session. Add a .claude-channel file or start the session from a directory matching a channel name.` }],
+      isError: true,
+    }
+  }
+
   try {
     switch (req.params.name) {
       case 'reply': {
@@ -466,14 +464,17 @@ function handleDaemonMessage(raw: string): void {
 
 function connectToSocket(): void {
   if (shuttingDown) return
+  if (!socketPath || !channelName) return  // Unconfigured session — no socket.
 
-  socket = net.createConnection(socketPath, () => {
+  const sockPath = socketPath
+  const project = channelName
+  socket = net.createConnection(sockPath, () => {
     if (shuttingDown || !socket || socket.destroyed) return
     process.stderr.write(`tg-relay plugin: connected to daemon socket\n`)
 
     const hello: Hello = {
       type: 'hello',
-      project: channelName,
+      project,
       pid: process.pid,
     }
     socket.write(JSON.stringify(hello) + '\n')
