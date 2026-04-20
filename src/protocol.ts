@@ -50,6 +50,7 @@ export type OutboundReply = {
   text: string
   reply_to?: string
   files?: string[]
+  voice?: boolean
 }
 
 export type OutboundReact = {
