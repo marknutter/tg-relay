@@ -28,6 +28,7 @@ import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
+import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -306,6 +307,7 @@ type ChannelState = {
   buffer: DaemonToPlugin[]
   approvalTimer: ReturnType<typeof setInterval>
   pluginProject: string | null
+  heartbeats: Map<string, HeartbeatSchedule>
 }
 
 const channels = new Map<string, ChannelState>()
@@ -905,10 +907,12 @@ async function startChannel(config: ChannelConfig): Promise<void> {
     buffer: [],
     approvalTimer: setInterval(() => checkApprovals(bot, config.stateDir, config.name), 5000),
     pluginProject: null,
+    heartbeats: new Map(),
   }
 
   channels.set(config.name, state)
   setupInboundHandlers(state)
+  reconcileHeartbeats(state)
 
   // Start polling with retry logic
   void (async () => {
@@ -956,6 +960,58 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   })()
 }
 
+// ── Heartbeat firing + reconciliation ───────────────────────────────────────
+
+function fireHeartbeat(state: ChannelState, hb: HeartbeatConfig): void {
+  // Skip if no plugin connected — stale scheduled prompts aren't useful.
+  if (!state.socket || state.socket.destroyed) {
+    log(state.config.name, `heartbeat "${hb.name}" skipped (no plugin connected)`)
+    return
+  }
+
+  // Reply routing: use the first allowlisted DM as the chat_id so Claude's
+  // reply lands somewhere sensible. Without an allowlist, there's nowhere
+  // to send a reply — skip.
+  const access = readAccessFile(state.config.stateDir)
+  const chatId = access.allowFrom[0]
+  if (!chatId) {
+    log(state.config.name, `heartbeat "${hb.name}" skipped (access.allowFrom is empty)`)
+    return
+  }
+
+  const inbound: InboundMessage = {
+    type: 'message',
+    chat_id: chatId,
+    user: 'heartbeat',
+    user_id: '0',
+    ts: new Date().toISOString(),
+    text: hb.prompt,
+    heartbeat: { name: hb.name },
+  }
+  sendToPlugin(state, inbound)
+  log(state.config.name, `heartbeat "${hb.name}" fired`)
+}
+
+function reconcileHeartbeats(state: ChannelState): void {
+  let desired: HeartbeatConfig[]
+  try {
+    desired = loadHeartbeats(state.config.stateDir)
+  } catch (err) {
+    log(state.config.name, `heartbeat config error: ${err}`)
+    return
+  }
+
+  const { schedules, errors } = reconcileSchedules(
+    state.heartbeats,
+    desired,
+    hb => fireHeartbeat(state, hb),
+  )
+  state.heartbeats = schedules
+  for (const { name, error } of errors) {
+    log(state.config.name, `heartbeat "${name}" skipped: ${error}`)
+  }
+}
+
 // ── Stop a single channel ───────────────────────────────────────────────────
 
 async function stopChannel(name: string): Promise<void> {
@@ -963,6 +1019,10 @@ async function stopChannel(name: string): Promise<void> {
   if (!state) return
 
   clearInterval(state.approvalTimer)
+
+  // Cancel all heartbeat cron jobs so they don't fire on a stopped channel.
+  for (const sched of state.heartbeats.values()) sched.job.stop()
+  state.heartbeats.clear()
 
   if (state.socket && !state.socket.destroyed) {
     state.socket.destroy()
@@ -1055,13 +1115,17 @@ function rescanChannels(): void {
     }
   }
 
-  for (const [name] of channels) {
+  for (const [name, state] of channels) {
     if (!discoveredNames.has(name)) {
       logGlobal(`channel removed: ${name}`)
       stopChannel(name).catch(err => {
         logGlobal(`failed to stop channel ${name}: ${err}`)
       })
+      continue
     }
+    // Reload heartbeats for existing channels so config changes take effect
+    // within the scan interval without a daemon restart.
+    reconcileHeartbeats(state)
   }
 }
 

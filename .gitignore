@@ -5,3 +5,4 @@ dist/
 tts/.venv/
 tts/__pycache__/
 **/*.pyc
+.claude/settings.local.json
