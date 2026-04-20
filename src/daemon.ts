@@ -54,7 +54,7 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 const PLUGIN_CACHE_DIR = join(HOME, '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram')
 const PLUGIN_ENTRY = join(import.meta.dir ?? '.', 'plugin.ts')
 const REPO_SKILLS_DIR = join(import.meta.dir ?? '.', '..', 'skills')
-const HIJACKED_SKILLS = ['access', 'configure']
+const HIJACKED_SKILLS = ['access', 'configure', 'heartbeat']
 const HIJACK_JSON = JSON.stringify({
   mcpServers: {
     telegram: {
@@ -1069,30 +1069,39 @@ function ensurePluginHijack(): void {
       }
     }
 
-    // Hijack skills (access, configure) — upstream hardcodes
-    // ~/.claude/channels/telegram/, ours resolves per-channel
+    // Hijack / add skills:
+    // - `access`, `configure` patch upstream's hardcoded single-state-dir versions
+    // - `heartbeat` is additive — upstream has no equivalent, we add it
+    // The check-if-dst-exists gate only determines whether we back up.
     for (const skill of HIJACKED_SKILLS) {
       const dst = join(versionDir, 'skills', skill, 'SKILL.md')
       const src = join(REPO_SKILLS_DIR, skill, 'SKILL.md')
-      if (!existsSync(dst) || !existsSync(src)) continue
+      if (!existsSync(src)) continue
 
-      let srcContent = '', dstContent = ''
-      try {
-        srcContent = readFileSync(src, 'utf8')
-        dstContent = readFileSync(dst, 'utf8')
-      } catch { continue }
+      let srcContent: string
+      try { srcContent = readFileSync(src, 'utf8') } catch { continue }
 
-      if (srcContent === dstContent) continue
-
-      const backup = `${dst}.bak`
-      if (!existsSync(backup)) {
-        try { writeFileSync(backup, dstContent) } catch {}
+      const dstExists = existsSync(dst)
+      let dstContent = ''
+      if (dstExists) {
+        try { dstContent = readFileSync(dst, 'utf8') } catch {}
       }
+      if (dstContent === srcContent) continue
+
+      if (dstExists) {
+        const backup = `${dst}.bak`
+        if (!existsSync(backup)) {
+          try { writeFileSync(backup, dstContent) } catch {}
+        }
+      } else {
+        try { mkdirSync(join(versionDir, 'skills', skill), { recursive: true }) } catch {}
+      }
+
       try {
         writeFileSync(dst, srcContent)
-        logGlobal(`patched skill ${skill} in v${version}`)
+        logGlobal(`${dstExists ? 'patched' : 'installed'} skill ${skill} in v${version}`)
       } catch (err) {
-        logGlobal(`failed to patch skill ${skill} v${version}: ${err}`)
+        logGlobal(`failed to install skill ${skill} v${version}: ${err}`)
       }
     }
   }

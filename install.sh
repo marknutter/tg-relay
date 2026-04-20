@@ -114,14 +114,19 @@ EOF
     # Also hijack the cached skills so /telegram:access and /telegram:configure
     # use per-channel state dirs (telegram-{name}/) instead of the upstream's
     # single hardcoded ~/.claude/channels/telegram/ path.
-    for SKILL in access configure; do
+    for SKILL in access configure heartbeat; do
       DST_SKILL="$version_dir/skills/$SKILL/SKILL.md"
       SRC_SKILL="$SCRIPT_DIR/skills/$SKILL/SKILL.md"
-      if [ -f "$DST_SKILL" ] && [ -f "$SRC_SKILL" ]; then
-        [ -f "$DST_SKILL.bak" ] || cp "$DST_SKILL" "$DST_SKILL.bak"
-        cp "$SRC_SKILL" "$DST_SKILL"
-        echo "   Patched $DST_SKILL"
+      [ -f "$SRC_SKILL" ] || continue
+      # If the upstream plugin had this skill, back up the original before
+      # overwriting. For skills we're adding (no upstream equivalent), just
+      # create the directory and drop it in.
+      if [ -f "$DST_SKILL" ] && [ ! -f "$DST_SKILL.bak" ]; then
+        cp "$DST_SKILL" "$DST_SKILL.bak"
       fi
+      mkdir -p "$(dirname "$DST_SKILL")"
+      cp "$SRC_SKILL" "$DST_SKILL"
+      echo "   Patched $DST_SKILL"
     done
   done
 fi
