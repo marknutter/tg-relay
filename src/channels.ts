@@ -38,9 +38,15 @@ export function discoverChannels(): ChannelConfig[] {
 
     let botToken: string | undefined
     try {
-      for (const line of readFileSync(envFile, 'utf8').split('\n')) {
+      const contents = readFileSync(envFile, 'utf8')
+      for (const line of contents.split('\n')) {
         const m = line.match(/^TELEGRAM_BOT_TOKEN=(.+)$/)
         if (m) { botToken = m[1].trim(); break }
+      }
+      // Fallback: bare token on a single line (claude-channel-add format)
+      if (!botToken) {
+        const trimmed = contents.trim()
+        if (/^\d+:[A-Za-z0-9_-]+$/.test(trimmed)) botToken = trimmed
       }
     } catch { continue }
 

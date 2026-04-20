@@ -26,6 +26,7 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
+import { transcribeAudio } from './transcribe.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -50,6 +51,8 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // bot-token polling slot).
 const PLUGIN_CACHE_DIR = join(HOME, '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram')
 const PLUGIN_ENTRY = join(import.meta.dir ?? '.', 'plugin.ts')
+const REPO_SKILLS_DIR = join(import.meta.dir ?? '.', '..', 'skills')
+const HIJACKED_SKILLS = ['access', 'configure']
 const HIJACK_JSON = JSON.stringify({
   mcpServers: {
     telegram: {
@@ -696,7 +699,36 @@ function setupInboundHandlers(state: ChannelState): void {
 
   bot.on('message:voice', async ctx => {
     const voice = ctx.message.voice
-    const text = ctx.message.caption ?? '(voice message)'
+    let text = ctx.message.caption ?? '(voice message)'
+
+    // Download and transcribe. If either fails, fall back to the placeholder.
+    try {
+      const file = await ctx.api.getFile(voice.file_id)
+      if (file.file_path) {
+        const token = config.botToken
+        const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`
+        const res = await fetch(url)
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer())
+          const ext = file.file_path.split('.').pop() ?? 'ogg'
+          const inboxDir = join(stateDir, 'inbox')
+          const audioPath = join(inboxDir, `${Date.now()}-${voice.file_unique_id}.${ext}`)
+          mkdirSync(inboxDir, { recursive: true })
+          writeFileSync(audioPath, buf)
+
+          const transcription = await transcribeAudio(audioPath)
+          if (transcription) {
+            text = transcription
+            log(channelName, `transcribed voice (${buf.length} bytes): ${transcription.slice(0, 80)}`)
+          } else {
+            log(channelName, `voice transcription failed, using placeholder`)
+          }
+        }
+      }
+    } catch (err) {
+      log(channelName, `voice download/transcribe error: ${err}`)
+    }
+
     await handleInbound(ctx, text, undefined, {
       kind: 'voice',
       file_id: voice.file_id,
@@ -932,26 +964,53 @@ function ensurePluginHijack(): void {
   try { entries = readdirSync(PLUGIN_CACHE_DIR) } catch { return }
 
   for (const version of entries) {
-    const mcpJson = join(PLUGIN_CACHE_DIR, version, '.mcp.json')
-    if (!existsSync(mcpJson)) continue
+    const versionDir = join(PLUGIN_CACHE_DIR, version)
 
-    let current: string
-    try { current = readFileSync(mcpJson, 'utf8') } catch { continue }
+    // Hijack .mcp.json (server entrypoint)
+    const mcpJson = join(versionDir, '.mcp.json')
+    if (existsSync(mcpJson)) {
+      let current = ''
+      try { current = readFileSync(mcpJson, 'utf8') } catch {}
 
-    // Skip if already hijacked (points to our plugin.ts)
-    if (current.includes(PLUGIN_ENTRY)) continue
-
-    // Backup original first time we see it
-    const backup = `${mcpJson}.bak`
-    if (!existsSync(backup)) {
-      try { writeFileSync(backup, current) } catch {}
+      if (!current.includes(PLUGIN_ENTRY)) {
+        const backup = `${mcpJson}.bak`
+        if (!existsSync(backup) && current) {
+          try { writeFileSync(backup, current) } catch {}
+        }
+        try {
+          writeFileSync(mcpJson, HIJACK_JSON + '\n')
+          logGlobal(`hijacked plugin v${version} -> ${PLUGIN_ENTRY}`)
+        } catch (err) {
+          logGlobal(`failed to hijack plugin v${version}: ${err}`)
+        }
+      }
     }
 
-    try {
-      writeFileSync(mcpJson, HIJACK_JSON + '\n')
-      logGlobal(`hijacked plugin v${version} -> ${PLUGIN_ENTRY}`)
-    } catch (err) {
-      logGlobal(`failed to hijack plugin v${version}: ${err}`)
+    // Hijack skills (access, configure) — upstream hardcodes
+    // ~/.claude/channels/telegram/, ours resolves per-channel
+    for (const skill of HIJACKED_SKILLS) {
+      const dst = join(versionDir, 'skills', skill, 'SKILL.md')
+      const src = join(REPO_SKILLS_DIR, skill, 'SKILL.md')
+      if (!existsSync(dst) || !existsSync(src)) continue
+
+      let srcContent = '', dstContent = ''
+      try {
+        srcContent = readFileSync(src, 'utf8')
+        dstContent = readFileSync(dst, 'utf8')
+      } catch { continue }
+
+      if (srcContent === dstContent) continue
+
+      const backup = `${dst}.bak`
+      if (!existsSync(backup)) {
+        try { writeFileSync(backup, dstContent) } catch {}
+      }
+      try {
+        writeFileSync(dst, srcContent)
+        logGlobal(`patched skill ${skill} in v${version}`)
+      } catch (err) {
+        logGlobal(`failed to patch skill ${skill} v${version}: ${err}`)
+      }
     }
   }
 }

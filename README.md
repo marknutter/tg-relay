@@ -26,11 +26,19 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 - [Bun](https://bun.sh) (runtime for both daemon and plugin)
 - macOS (for launchd; systemd adaptation is straightforward)
 - Existing channel config at `~/.claude/channels/telegram-*/` (created by `claude-channel-add`)
+- **Optional** (for voice note transcription): `whisper-cpp` and `ffmpeg`
+  ```bash
+  brew install whisper-cpp ffmpeg
+  mkdir -p ~/.cache/whisper.cpp/models
+  curl -L -o ~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+  ```
+  When configured, inbound Telegram voice notes are auto-transcribed and delivered as text. Without these tools, voice notes arrive as `(voice message)` placeholder with an `attachment_file_id` that Claude can download but not listen to.
 
 ## Setup
 
 ```bash
-cd ~/Kode/tg-relay
+cd ~/Code/tg-relay
 bun install
 ./install.sh
 ```
@@ -54,19 +62,19 @@ Once installed, `claude!` from any project directory auto-connects to the right 
 
 ### Adding a new project
 
-If your project directory name matches the channel name (e.g. `~/Kode/myproject` and `telegram-myproject`):
+If your project directory name matches the channel name (e.g. `~/Code/myproject` and `telegram-myproject`):
 
 ```bash
 claude-channel-add myproject <BOT_TOKEN>
 # Wait ~30s for the daemon to discover it, then:
-cd ~/Kode/myproject
+cd ~/Code/myproject
 claude!
 ```
 
 If your directory name doesn't match, drop a `.claude-channel` file in the project root:
 
 ```bash
-echo "mybot" > ~/Kode/some-other-name/.claude-channel
+echo "mybot" > ~/Code/some-other-name/.claude-channel
 claude-channel-add mybot <BOT_TOKEN>
 ```
 
@@ -85,6 +93,7 @@ The daemon picks up new channels automatically — no restart needed.
 | `TG_RELAY_LOG` | Log file path | `~/.claude/channels/telegram-router.log` |
 | `TG_RELAY_CHANNELS_ROOT` | Base dir for channel configs | `~/.claude/channels` |
 | `TG_RELAY_SCAN_INTERVAL` | Seconds between channel dir rescans | `30` |
+| `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
 
 ## Development
 
