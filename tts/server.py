@@ -14,6 +14,7 @@ The model (F5TTS_v1_Base) is loaded once at startup and kept warm.
 """
 
 import io
+import json
 import logging
 import os
 import sys
@@ -67,6 +68,22 @@ def resolve_reference(channel: str) -> tuple[Path, str] | None:
                 log.warning(f"failed reading {txt}: {err}")
     return None
 
+
+def load_channel_config(channel: str) -> dict:
+    """Read <channel-dir>/tts.json then global tts.json. Returns merged dict, {} if neither exists."""
+    merged: dict = {}
+    for base in (GLOBAL_REF_DIR, CHANNELS_ROOT / f"telegram-{channel}"):
+        cfg_path = base / "tts.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                merged.update(data)
+        except Exception as err:
+            log.warning(f"failed parsing {cfg_path}: {err}")
+    return merged
+
 # ── HTTP API ────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="tg-relay-tts")
@@ -76,6 +93,7 @@ class SynthesizeRequest(BaseModel):
     text: str
     channel: str
     nfe_step: int | None = None
+    speed: float | None = None
 
 
 @app.get("/health")
@@ -97,8 +115,10 @@ def synthesize(req: SynthesizeRequest):
         )
 
     ref_audio, ref_text = ref
-    nfe = req.nfe_step or DEFAULT_NFE_STEP
-    log.info(f"synthesize channel={req.channel} nfe={nfe} text={req.text[:60]!r}")
+    cfg = load_channel_config(req.channel)
+    nfe = req.nfe_step or cfg.get("nfe_step") or DEFAULT_NFE_STEP
+    speed = req.speed if req.speed is not None else float(cfg.get("speed", 1.0))
+    log.info(f"synthesize channel={req.channel} nfe={nfe} speed={speed} text={req.text[:60]!r}")
 
     try:
         wav, sr, _ = tts.infer(
@@ -106,6 +126,7 @@ def synthesize(req: SynthesizeRequest):
             ref_text=ref_text,
             gen_text=req.text,
             nfe_step=nfe,
+            speed=speed,
             show_info=lambda *_: None,  # silence stdout chatter
             progress=None,
         )

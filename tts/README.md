@@ -55,6 +55,27 @@ ffmpeg -i source.m4a -ar 24000 -ac 1 -c:a pcm_s16le reference.wav
 
 Then write the transcript to `reference.txt` — carefully, word for word. F5-TTS quality is extremely sensitive to transcript accuracy.
 
+## Per-channel config (optional)
+
+Drop a `tts.json` next to the reference files to override synthesis defaults
+for a specific channel:
+
+```
+~/.claude/channels/telegram-<name>/tts.json
+```
+
+Supported keys (all optional):
+
+| Key | Type | Effect |
+|-----|------|--------|
+| `speed` | float | Playback speed multiplier. `1.0` = native, `0.9` = slower, `1.15` = faster. |
+| `nfe_step` | int | Diffusion steps (per-channel override of `TG_RELAY_TTS_NFE_STEP`). |
+
+A `~/.cache/tg-relay-tts/tts.json` file works the same way as a global
+fallback. Per-channel keys override global keys; missing keys fall back to
+defaults. The sidecar re-reads these files on every synthesis request — no
+restart needed.
+
 ## Verify
 
 ```bash
