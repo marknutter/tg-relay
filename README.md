@@ -25,7 +25,7 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 
 - [Bun](https://bun.sh) (runtime for both daemon and plugin)
 - macOS (for launchd; systemd adaptation is straightforward)
-- Existing channel config at `~/.claude/channels/telegram-*/` (created by `claude-channel-add`)
+- A configured channel at `~/.claude/channels/telegram-<name>/` (install.sh drops a `claude-channel-add` helper into `~/bin/` — see Usage below)
 - **Optional** (for voice note transcription): `whisper-cpp` and `ffmpeg`
   ```bash
   brew install whisper-cpp ffmpeg
@@ -66,6 +66,7 @@ Once installed, `claude!` from any project directory auto-connects to the right 
 If your project directory name matches the channel name (e.g. `~/Code/myproject` and `telegram-myproject`):
 
 ```bash
+# From BotFather: grab the token, then:
 claude-channel-add myproject <BOT_TOKEN>
 # Wait ~30s for the daemon to discover it, then:
 cd ~/Code/myproject

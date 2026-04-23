@@ -155,9 +155,37 @@ with open('$SETTINGS', 'w') as f:
 " 2>/dev/null && echo "   Enabled telegram plugin in settings (runs tg-relay code)."
 fi
 
-# 4. Set up shell alias
+# 4. Install claude-channel-add helper into ~/bin
 echo ""
-echo "4. Shell alias"
+echo "4. Installing claude-channel-add helper..."
+
+BIN_DIR="$HOME/bin"
+BIN_SRC="$SCRIPT_DIR/bin/claude-channel-add"
+BIN_DST="$BIN_DIR/claude-channel-add"
+
+if [ -f "$BIN_SRC" ]; then
+  mkdir -p "$BIN_DIR"
+  # If an older version is already present, replace it; preserving backup once.
+  if [ -f "$BIN_DST" ] && ! cmp -s "$BIN_SRC" "$BIN_DST"; then
+    [ -f "$BIN_DST.bak" ] || cp "$BIN_DST" "$BIN_DST.bak"
+  fi
+  cp "$BIN_SRC" "$BIN_DST"
+  chmod +x "$BIN_DST"
+  echo "   Installed: $BIN_DST"
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) : ;;  # already on PATH, nothing to say
+    *)
+      echo "   Note: $BIN_DIR is not on your PATH."
+      echo "   Add this to your ~/.zshrc (or equivalent):"
+      echo "     export PATH=\"\$HOME/bin:\$PATH\""
+      ;;
+  esac
+fi
+
+# 5. Set up shell alias
+echo ""
+echo "5. Shell alias"
 echo ""
 echo "   Add this to your ~/.zshrc (or equivalent):"
 echo ""
