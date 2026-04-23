@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Usage: claude-channel-add <name> <bot-token> [--owner <telegram-user-id>]
+# Example: claude-channel-add mtl 8675038482:AAE1GTuG...
+#
+# Creates a tg-relay Telegram channel for a Claude Code project:
+#   1. Creates state dir at ~/.claude/channels/telegram-<name>/
+#   2. Saves the bot token to .env
+#   3. Allowlists your Telegram user ID (no pairing dance)
+#
+# After running: the tg-relay daemon picks up the new channel within 30s.
+# Start a session with `claude!` from a directory named <name> or containing
+# a .claude-channel file with that name — the plugin resolves the channel
+# from cwd automatically.
+#
+# The owner Telegram user ID is resolved in this order:
+#   1. --owner <id> flag
+#   2. TG_RELAY_OWNER env var
+#   3. The allowFrom[0] of any existing channel on this machine
+#   4. Falls back to pairing mode — DM the bot, get a 6-char code,
+#      run /telegram:access pair <code> in a session
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: claude-channel-add <name> <bot-token> [--owner <telegram-user-id>]"
+  echo ""
+  echo "Example:"
+  echo "  claude-channel-add mtl 8675038482:AAE1GTuG..."
+  exit 1
+}
+
+[[ $# -lt 2 ]] && usage
+
+name="$1"
+token="$2"
+shift 2
+
+owner=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owner) owner="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1"; usage ;;
+  esac
+done
+
+# Fall back to env var
+[[ -z "$owner" ]] && owner="${TG_RELAY_OWNER:-}"
+
+# Fall back to allowFrom[0] of any existing channel
+if [[ -z "$owner" ]]; then
+  for existing in "$HOME"/.claude/channels/telegram-*/access.json; do
+    [[ -f "$existing" ]] || continue
+    owner=$(grep -oE '"[0-9]+"' "$existing" | head -1 | tr -d '"')
+    [[ -n "$owner" ]] && break
+  done
+fi
+
+# Name: lowercase alphanumeric + hyphens only — keeps socket paths simple
+if [[ ! "$name" =~ ^[a-z0-9-]+$ ]]; then
+  echo "Error: channel name must be lowercase alphanumeric with hyphens."
+  exit 1
+fi
+
+# Token: <digits>:<base64-ish> — bot.<id>:<secret>
+if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+  echo "Error: token doesn't match bot-token format (123456789:AAHx...)"
+  exit 1
+fi
+
+state_dir="$HOME/.claude/channels/telegram-${name}"
+
+if [[ -d "$state_dir" ]]; then
+  echo "Error: $state_dir already exists. Delete it first if you want to recreate."
+  exit 1
+fi
+
+mkdir -p "$state_dir/approved"
+
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token" > "$state_dir/.env"
+chmod 600 "$state_dir/.env"
+
+if [[ -n "$owner" ]]; then
+  cat > "$state_dir/access.json" <<EOF
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": [
+    "$owner"
+  ],
+  "groups": {},
+  "pending": {}
+}
+EOF
+  # The approval marker is what the daemon polls to send the "Paired!"
+  # confirmation, so pre-seeding skips that.
+  echo "$owner" > "$state_dir/approved/$owner"
+  echo "Owner $owner pre-allowlisted. Bot is ready to receive messages from you."
+else
+  cat > "$state_dir/access.json" <<'EOF'
+{
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "groups": {},
+  "pending": {}
+}
+EOF
+  echo "No owner ID provided — channel opens in pairing mode."
+  echo "Next: DM the bot, get a 6-char code, run '/telegram:access pair <code>' in a session."
+fi
+
+echo ""
+echo "Channel '$name' created at $state_dir"
+echo "The tg-relay daemon will pick it up within 30s (see ~/.claude/channels/telegram-router.log)."
+echo ""
+echo "To start a session for this channel:"
+echo "  cd ~/Kode/$name   # or any dir, then drop: echo $name > .claude-channel"
+echo "  claude!"
