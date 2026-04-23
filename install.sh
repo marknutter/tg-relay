@@ -65,6 +65,8 @@ cat > "$PLIST_DST" << EOF
   <dict>
     <key>HOME</key>
     <string>$HOME</string>
+    <key>TG_RELAY_TTS_TIMEOUT_MS</key>
+    <string>300000</string>
   </dict>
   <key>ThrottleInterval</key>
   <integer>5</integer>
