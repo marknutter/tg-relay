@@ -303,10 +303,21 @@ type ChannelState = {
   bot: Bot
   botUsername: string
   server: net.Server
-  socket: net.Socket | null
+  /**
+   * Every live plugin connection on this channel. Multiple sessions per
+   * channel are supported — e.g. two worktrees of the same project, or a
+   * resumed session that overlaps with the original. Inbound messages
+   * fan out to every socket; outbound from any session is treated equally.
+   * JS Sets preserve insertion order, so the most-recently-connected
+   * socket is always Array.from(sockets).pop().
+   */
+  sockets: Set<net.Socket>
+  /**
+   * Per-socket project labels for logging. Keyed by socket reference.
+   */
+  socketProjects: Map<net.Socket, string>
   buffer: DaemonToPlugin[]
   approvalTimer: ReturnType<typeof setInterval>
-  pluginProject: string | null
   heartbeats: Map<string, HeartbeatSchedule>
 }
 
@@ -314,27 +325,67 @@ const channels = new Map<string, ChannelState>()
 
 // ── Socket helpers ──────────────────────────────────────────────────────────
 
-function sendToPlugin(state: ChannelState, msg: DaemonToPlugin): void {
-  if (state.socket && !state.socket.destroyed) {
-    state.socket.write(JSON.stringify(msg) + '\n')
-  } else {
+function liveSockets(state: ChannelState): net.Socket[] {
+  const live: net.Socket[] = []
+  for (const s of state.sockets) {
+    if (!s.destroyed) live.push(s)
+  }
+  return live
+}
+
+/**
+ * Most-recently-connected live socket, or null. Used for heartbeat routing
+ * (we want a heartbeat to land in exactly one session, not all of them).
+ */
+function lastSocket(state: ChannelState): net.Socket | null {
+  const live = liveSockets(state)
+  return live.length > 0 ? live[live.length - 1]! : null
+}
+
+function writeToSocket(socket: net.Socket, msg: unknown): void {
+  if (socket.destroyed) return
+  socket.write(JSON.stringify(msg) + '\n')
+}
+
+/**
+ * Broadcast to every live plugin socket. Used for inbound Telegram
+ * messages and permission decisions — both are "everyone watching the
+ * channel should see this" events.
+ */
+function broadcastToPlugins(state: ChannelState, msg: DaemonToPlugin): void {
+  const live = liveSockets(state)
+  if (live.length === 0) {
     if (state.buffer.length < MESSAGE_BUFFER_CAP) {
       state.buffer.push(msg)
     }
+    return
   }
+  for (const s of live) writeToSocket(s, msg)
 }
 
-function flushBuffer(state: ChannelState): void {
-  if (!state.socket || state.socket.destroyed) return
+// Keep the old name as an alias so existing call sites read naturally.
+const sendToPlugin = broadcastToPlugins
+
+/**
+ * Drain the per-channel buffer onto a single newly-connected socket.
+ * Called once on Hello so the first session to (re)connect gets the
+ * backlog — not every socket on every send.
+ */
+function flushBufferToSocket(state: ChannelState, socket: net.Socket): void {
+  if (socket.destroyed) return
   while (state.buffer.length > 0) {
     const msg = state.buffer.shift()!
-    state.socket.write(JSON.stringify(msg) + '\n')
+    writeToSocket(socket, msg)
   }
 }
 
 // ── Handle outbound messages from plugin ────────────────────────────────────
 
-async function handlePluginMessage(state: ChannelState, raw: string): Promise<void> {
+async function handlePluginMessage(
+  state: ChannelState,
+  socket: net.Socket,
+  raw: string,
+): Promise<void> {
   let parsed: PluginToDaemon | Hello
   try {
     parsed = JSON.parse(raw)
@@ -343,18 +394,18 @@ async function handlePluginMessage(state: ChannelState, raw: string): Promise<vo
     return
   }
 
-  // Hello handshake
+  // Hello handshake — Ack and buffer-flush go to the originating socket only.
   if (parsed.type === 'hello') {
     const hello = parsed as Hello
-    state.pluginProject = hello.project
+    state.socketProjects.set(socket, hello.project)
     const ack: Ack = {
       type: 'ack',
       project: hello.project,
       bot_username: state.botUsername,
     }
-    state.socket?.write(JSON.stringify(ack) + '\n')
-    log(state.config.name, `plugin connected: project=${hello.project} pid=${hello.pid}`)
-    flushBuffer(state)
+    writeToSocket(socket, ack)
+    log(state.config.name, `plugin connected: project=${hello.project} pid=${hello.pid} (sockets=${liveSockets(state).length})`)
+    flushBufferToSocket(state, socket)
     return
   }
 
@@ -468,7 +519,9 @@ async function handlePluginMessage(state: ChannelState, raw: string): Promise<vo
             request_id: msg.request_id,
             path,
           }
-          state.socket?.write(JSON.stringify(result) + '\n')
+          // Route the response back to the originating socket only — other
+          // sessions didn't ask for this file and don't care about the result.
+          writeToSocket(socket, result)
           log(state.config.name, `downloaded file -> ${path}`)
         } catch (err) {
           const result: OutboundDownloadResult = {
@@ -476,7 +529,7 @@ async function handlePluginMessage(state: ChannelState, raw: string): Promise<vo
             request_id: msg.request_id,
             error: err instanceof Error ? err.message : String(err),
           }
-          state.socket?.write(JSON.stringify(result) + '\n')
+          writeToSocket(socket, result)
           log(state.config.name, `download failed: ${err}`)
         }
         break
@@ -533,15 +586,14 @@ function setupInboundHandlers(state: ChannelState): void {
       return
     }
 
-    // Send permission decision to plugin as a daemon→plugin message
-    if (state.socket && !state.socket.destroyed) {
-      const decision = {
-        type: 'permission_decision' as const,
-        request_id,
-        behavior: behavior as 'allow' | 'deny',
-      }
-      state.socket.write(JSON.stringify(decision) + '\n')
-    }
+    // Broadcast permission decision to every connected plugin. We don't
+    // know which session originated the request_id; sending to all is safe
+    // (the MCP client ignores unknown request_ids).
+    broadcastToPlugins(state, {
+      type: 'permission_decision',
+      request_id,
+      behavior: behavior as 'allow' | 'deny',
+    })
 
     const label = behavior === 'allow' ? 'Allowed' : 'Denied'
     await ctx.answerCallbackQuery({ text: label }).catch(() => {})
@@ -624,17 +676,14 @@ function setupInboundHandlers(state: ChannelState): void {
     const chat_id = String(ctx.chat!.id)
     const msgId = ctx.message?.message_id
 
-    // Permission-reply intercept
+    // Permission-reply intercept (text-form: "y abcde" / "n abcde").
     const permMatch = PERMISSION_REPLY_RE.exec(text)
     if (permMatch) {
-      if (state.socket && !state.socket.destroyed) {
-        const decision = {
-          type: 'permission_decision' as const,
-          request_id: permMatch[2]!.toLowerCase(),
-          behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
-        }
-        state.socket.write(JSON.stringify(decision) + '\n')
-      }
+      broadcastToPlugins(state, {
+        type: 'permission_decision',
+        request_id: permMatch[2]!.toLowerCase(),
+        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+      })
       if (msgId != null) {
         const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
         void bot.api.setMessageReaction(chat_id, msgId, [
@@ -849,17 +898,11 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   // Clean up stale socket file
   try { unlinkSync(config.socketPath) } catch {}
 
-  // Create the unix socket server
+  // Create the unix socket server. Multiple plugin connections per channel
+  // are supported — see ChannelState.sockets for the rationale.
   const server = net.createServer(socket => {
-    log(config.name, 'plugin socket connected')
-
-    // Only one plugin connection at a time per channel
-    if (state.socket && !state.socket.destroyed) {
-      log(config.name, 'replacing existing plugin connection')
-      state.socket.destroy()
-    }
-    state.socket = socket
-    state.pluginProject = null
+    state.sockets.add(socket)
+    log(config.name, `plugin socket connected (sockets=${liveSockets(state).length})`)
 
     let lineBuf = ''
     socket.on('data', data => {
@@ -869,7 +912,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
         const line = lineBuf.slice(0, newlineIdx)
         lineBuf = lineBuf.slice(newlineIdx + 1)
         if (line.trim()) {
-          handlePluginMessage(state, line).catch(err => {
+          handlePluginMessage(state, socket, line).catch(err => {
             log(config.name, `error handling plugin message: ${err}`)
           })
         }
@@ -877,11 +920,10 @@ async function startChannel(config: ChannelConfig): Promise<void> {
     })
 
     socket.on('close', () => {
-      log(config.name, `plugin disconnected (project=${state.pluginProject ?? 'unknown'})`)
-      if (state.socket === socket) {
-        state.socket = null
-        state.pluginProject = null
-      }
+      const project = state.socketProjects.get(socket) ?? 'unknown'
+      state.sockets.delete(socket)
+      state.socketProjects.delete(socket)
+      log(config.name, `plugin disconnected (project=${project}, sockets=${liveSockets(state).length})`)
     })
 
     socket.on('error', err => {
@@ -903,10 +945,10 @@ async function startChannel(config: ChannelConfig): Promise<void> {
     bot,
     botUsername: '',
     server,
-    socket: null,
+    sockets: new Set(),
+    socketProjects: new Map(),
     buffer: [],
     approvalTimer: setInterval(() => checkApprovals(bot, config.stateDir, config.name), 5000),
-    pluginProject: null,
     heartbeats: new Map(),
   }
 
@@ -963,8 +1005,12 @@ async function startChannel(config: ChannelConfig): Promise<void> {
 // ── Heartbeat firing + reconciliation ───────────────────────────────────────
 
 function fireHeartbeat(state: ChannelState, hb: HeartbeatConfig): void {
-  // Skip if no plugin connected — stale scheduled prompts aren't useful.
-  if (!state.socket || state.socket.destroyed) {
+  // Pick exactly one session to receive the heartbeat. Broadcasting would
+  // cause every connected session to act on the same scheduled prompt,
+  // producing duplicate Telegram replies. Most-recently-connected is the
+  // tiebreaker — likely your active foreground session.
+  const target = lastSocket(state)
+  if (!target) {
     log(state.config.name, `heartbeat "${hb.name}" skipped (no plugin connected)`)
     return
   }
@@ -988,8 +1034,8 @@ function fireHeartbeat(state: ChannelState, hb: HeartbeatConfig): void {
     text: hb.prompt,
     heartbeat: { name: hb.name },
   }
-  sendToPlugin(state, inbound)
-  log(state.config.name, `heartbeat "${hb.name}" fired`)
+  writeToSocket(target, inbound)
+  log(state.config.name, `heartbeat "${hb.name}" fired (sockets=${liveSockets(state).length}, target=most-recent)`)
 }
 
 function reconcileHeartbeats(state: ChannelState): void {
@@ -1024,9 +1070,11 @@ async function stopChannel(name: string): Promise<void> {
   for (const sched of state.heartbeats.values()) sched.job.stop()
   state.heartbeats.clear()
 
-  if (state.socket && !state.socket.destroyed) {
-    state.socket.destroy()
+  for (const s of state.sockets) {
+    if (!s.destroyed) s.destroy()
   }
+  state.sockets.clear()
+  state.socketProjects.clear()
 
   state.server.close()
   try { unlinkSync(state.config.socketPath) } catch {}
