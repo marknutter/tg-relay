@@ -626,9 +626,11 @@ function startParentWatchdog(): void {
 
 // MCP transport
 const transport = new StdioServerTransport()
-transport.onclose = () => {
-  process.stderr.write('tg-relay plugin: MCP transport closed\n')
-  shutdown('mcp-transport-close')
+if (!process.env.TG_RELAY_TEST_DISABLE_STDIN_SHUTDOWN) {
+  transport.onclose = () => {
+    process.stderr.write('tg-relay plugin: MCP transport closed\n')
+    shutdown('mcp-transport-close')
+  }
 }
 mcp.onerror = (err: Error) => {
   process.stderr.write(`tg-relay plugin: MCP error: ${err}\n`)
@@ -643,13 +645,24 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
   }
 })
 
-// stdin close = session ended
-process.stdin.on('end', () => {
-  setTimeout(() => {
-    if (process.stdin.destroyed) shutdown('stdin-end')
-  }, 500)
-})
-process.stdin.on('close', () => shutdown('stdin-close'))
+// stdin close = session ended.
+// Tests that exercise the daemon-side reaper need a way to keep an orphan
+// plugin alive long enough for the reaper to act, even though the test
+// harness pipe closes — set TG_RELAY_TEST_DISABLE_STDIN_SHUTDOWN=1. The
+// keep-alive interval below is necessary because, once stdin/transport
+// shutdown is disabled and the parent-watchdog timer is .unref()'d, an
+// orphan plugin would otherwise exit naturally as soon as the event loop
+// has nothing to do.
+if (!process.env.TG_RELAY_TEST_DISABLE_STDIN_SHUTDOWN) {
+  process.stdin.on('end', () => {
+    setTimeout(() => {
+      if (process.stdin.destroyed) shutdown('stdin-end')
+    }, 500)
+  })
+  process.stdin.on('close', () => shutdown('stdin-close'))
+} else {
+  setInterval(() => {}, 60_000)
+}
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
