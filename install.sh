@@ -70,6 +70,8 @@ cat > "$PLIST_DST" << EOF
   </dict>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <key>ExitTimeOut</key>
+  <integer>15</integer>
 </dict>
 </plist>
 EOF

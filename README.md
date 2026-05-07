@@ -139,6 +139,8 @@ For heartbeats that must survive session closes, keep the session alive in tmux 
 | `TG_RELAY_CHANNELS_ROOT` | Base dir for channel configs | `~/.claude/channels` |
 | `TG_RELAY_SCAN_INTERVAL` | Seconds between channel dir rescans | `30` |
 | `TG_RELAY_REPLAY_CAP` | Max number of pending messages replayed onto a freshly-bound socket. Older entries stay on disk and are summarized in a single elided-notice message. | `50` |
+| `TG_RELAY_CHANNEL_STOP_TIMEOUT_MS` | Per-channel `bot.stop()` deadline during shutdown. Caps how long we wait for grammY's confirmation `getUpdates` to return after the abort signal fires (issue #37). | `4000` |
+| `TG_RELAY_SHUTDOWN_TIMEOUT_MS` | Global daemon-shutdown deadline. Must be less than the plist's `ExitTimeOut` (15s) so the runtime exits before launchd resorts to `SIGKILL`. Exceeding this logs a warning and exits anyway. | `10000` |
 | `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
 
 ## Development
@@ -147,6 +149,15 @@ For heartbeats that must survive session closes, keep the session alive in tmux 
 bun src/daemon.ts   # Run daemon in foreground (for debugging)
 bun src/plugin.ts   # Run plugin standalone (for testing socket connection)
 ```
+
+### A note on polling abort semantics
+
+Telegram's Bot API treats every long-poll `getUpdates` call as registering the caller as the active consumer. If the connection isn't aborted cleanly on shutdown, the next `getUpdates` from a fresh process gets `409 Conflict` until the previous registration ages out (~30s). grammY handles this internally — `bot.stop()` aborts the in-flight fetch via its `pollingAbortController` — but only if `bot.stop()` is actually called and gets to complete. Any future polling-related code path must:
+
+1. Call `bot.stop()` (or its equivalent) on every shutdown path — SIGTERM, SIGINT, channel removal, daemon exit.
+2. **Await** the result so the abort-then-confirm sequence can finish before the process exits.
+3. Bound the wait with a timeout (see `stopBotWithTimeout` in `src/daemon.ts`) — a hung confirmation must not block process exit indefinitely or get cut off by launchd's `ExitTimeOut`.
+4. Log abort and outcome so a future 409 storm is visibly correlated with a failed shutdown.
 
 ## How it handles the failure modes we hit
 
