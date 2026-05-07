@@ -35,11 +35,12 @@ import type {
   ForwardPermissionRequest,
 } from './protocol.js'
 import net from 'net'
+import { execFileSync } from 'child_process'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const HOME = homedir()
-const CHANNELS_ROOT = join(HOME, '.claude', 'channels')
+const CHANNELS_ROOT = process.env.TG_RELAY_CHANNELS_ROOT ?? join(HOME, '.claude', 'channels')
 const LOG_FILE = process.env.TG_RELAY_LOG ?? join(CHANNELS_ROOT, 'telegram-router.log')
 const SCAN_INTERVAL = parseInt(process.env.TG_RELAY_SCAN_INTERVAL ?? '30', 10) * 1000
 const MESSAGE_BUFFER_CAP = 100
@@ -69,12 +70,16 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 
+// Under launchd the plist routes stderr directly to telegram-router.log via
+// StandardErrorPath, so we'd double-write if we appendFileSync'd ourselves.
+// XPC_SERVICE_NAME is set by launchd and not by interactive shells / tests,
+// so we can use it to detect that environment.
+const STDERR_GOES_TO_LOG_FILE = !!process.env.XPC_SERVICE_NAME
+
 function log(channel: string, msg: string): void {
   const line = `[${new Date().toISOString()}] [${channel}] ${msg}\n`
   process.stderr.write(line)
-  // Under launchd, stderr already goes to the log file — don't double-write.
-  // Only appendFileSync when running interactively (stderr is a TTY).
-  if (!process.stderr.isTTY) return
+  if (STDERR_GOES_TO_LOG_FILE) return
   try { appendFileSync(LOG_FILE, line) } catch {}
 }
 
@@ -316,6 +321,18 @@ type ChannelState = {
    * Per-socket project labels for logging. Keyed by socket reference.
    */
   socketProjects: Map<net.Socket, string>
+  /**
+   * Per-socket plugin PIDs from Hello messages. Used by the orphan reaper
+   * to know which plugin processes are legitimately connected (issue #26).
+   */
+  socketPids: Map<net.Socket, number>
+  /**
+   * Per-socket timestamp (ms) of last inbound message from the plugin.
+   * Used by the hung-plugin detector — a connected plugin that has been
+   * silent for >HANG_SILENCE_MS while its PID is pegging CPU is reaped
+   * by SIGKILL (issue #26).
+   */
+  socketLastActivity: Map<net.Socket, number>
   buffer: DaemonToPlugin[]
   approvalTimer: ReturnType<typeof setInterval>
   heartbeats: Map<string, HeartbeatSchedule>
@@ -398,6 +415,7 @@ async function handlePluginMessage(
   if (parsed.type === 'hello') {
     const hello = parsed as Hello
     state.socketProjects.set(socket, hello.project)
+    state.socketPids.set(socket, hello.pid)
     const ack: Ack = {
       type: 'ack',
       project: hello.project,
@@ -906,6 +924,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
 
     let lineBuf = ''
     socket.on('data', data => {
+      state.socketLastActivity.set(socket, Date.now())
       lineBuf += data.toString()
       let newlineIdx: number
       while ((newlineIdx = lineBuf.indexOf('\n')) !== -1) {
@@ -921,9 +940,12 @@ async function startChannel(config: ChannelConfig): Promise<void> {
 
     socket.on('close', () => {
       const project = state.socketProjects.get(socket) ?? 'unknown'
+      const pid = state.socketPids.get(socket)
       state.sockets.delete(socket)
       state.socketProjects.delete(socket)
-      log(config.name, `plugin disconnected (project=${project}, sockets=${liveSockets(state).length})`)
+      state.socketPids.delete(socket)
+      state.socketLastActivity.delete(socket)
+      log(config.name, `plugin disconnected (project=${project}, pid=${pid ?? 'unknown'}, sockets=${liveSockets(state).length})`)
     })
 
     socket.on('error', err => {
@@ -947,6 +969,8 @@ async function startChannel(config: ChannelConfig): Promise<void> {
     server,
     sockets: new Set(),
     socketProjects: new Map(),
+    socketPids: new Map(),
+    socketLastActivity: new Map(),
     buffer: [],
     approvalTimer: setInterval(() => checkApprovals(bot, config.stateDir, config.name), 5000),
     heartbeats: new Map(),
@@ -1186,6 +1210,160 @@ function rescanChannels(): void {
   }
 }
 
+// ── Orphan plugin reaper ────────────────────────────────────────────────────
+//
+// Defense-in-depth for issue #26. Even with the plugin's own parent-liveness
+// watchdog, edge cases (event loop blocked, kernel quirks) can leave plugin
+// processes alive after their parent Claude Code session exits. The daemon
+// is the natural place to catch these because it already knows which plugin
+// PIDs are legitimately connected (from Hello messages) and has a stable
+// long-running lifecycle to host the reaper.
+//
+// Strategy: every REAPER_INTERVAL_MS, list all `bun .../src/plugin.ts`
+// processes via `ps`. Any PID *not* currently connected to any channel and
+// continuously unaccounted for >= REAPER_GRACE_MS is SIGKILL'd. The grace
+// period spares plugins that just spawned and haven't sent Hello yet.
+
+const REAPER_INTERVAL_MS = 30_000
+const REAPER_GRACE_MS = 30_000
+
+/** PID -> first ts (ms) we noticed this PID running but unaccounted-for. */
+const unaccountedFirstSeen = new Map<number, number>()
+
+function connectedPluginPids(): Set<number> {
+  const pids = new Set<number>()
+  for (const state of channels.values()) {
+    for (const pid of state.socketPids.values()) pids.add(pid)
+  }
+  return pids
+}
+
+/**
+ * Returns the set of PIDs currently running our plugin.ts via bun. Matches
+ * either the absolute path (how production / install.sh launches it) or
+ * the trailing `src/plugin.ts` (how `bun src/plugin.ts` from cwd=repo
+ * appears in `ps` — relative path). Combined with a `bun` token in the
+ * command line, this only catches our own plugin processes.
+ */
+function findRunningPluginPids(): Set<number> {
+  const pids = new Set<number>()
+  let raw: string
+  try {
+    raw = execFileSync('ps', ['-axo', 'pid=,command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  } catch {
+    return pids
+  }
+  const PLUGIN_TAIL = 'src/plugin.ts'
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    // Must match either the absolute install.sh path, or contain the
+    // src/plugin.ts tail (with src/ prefix to avoid catching unrelated
+    // files named plugin.ts elsewhere in the system).
+    const matchesEntry = trimmed.includes(PLUGIN_ENTRY) || trimmed.includes(PLUGIN_TAIL)
+    if (!matchesEntry) continue
+    if (!trimmed.includes('bun')) continue
+    const m = trimmed.match(/^(\d+)\s/)
+    if (!m) continue
+    const pid = parseInt(m[1]!, 10)
+    if (pid === process.pid) continue
+    pids.add(pid)
+  }
+  return pids
+}
+
+function reapOrphanPlugins(): void {
+  const running = findRunningPluginPids()
+  const connected = connectedPluginPids()
+  const now = Date.now()
+
+  // Forget any PIDs that have either reconnected or actually died.
+  for (const pid of unaccountedFirstSeen.keys()) {
+    if (connected.has(pid) || !running.has(pid)) {
+      unaccountedFirstSeen.delete(pid)
+    }
+  }
+
+  for (const pid of running) {
+    if (connected.has(pid)) continue
+    const firstSeen = unaccountedFirstSeen.get(pid)
+    if (firstSeen == null) {
+      unaccountedFirstSeen.set(pid, now)
+      continue
+    }
+    const ageMs = now - firstSeen
+    if (ageMs < REAPER_GRACE_MS) continue
+    try {
+      process.kill(pid, 'SIGKILL')
+      logGlobal(`reaped orphan plugin pid=${pid} age=${Math.round(ageMs / 1000)}s`)
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'ESRCH') {
+        logGlobal(`failed to reap orphan plugin pid=${pid}: ${err}`)
+      }
+    }
+    unaccountedFirstSeen.delete(pid)
+  }
+}
+
+// ── Hung-plugin detector ────────────────────────────────────────────────────
+//
+// A plugin process can hang while still holding a socket connection — the
+// orphan reaper above only catches plugins whose connection has already
+// dropped. If a plugin's event loop blocks but the kernel keeps the socket
+// half-alive, the daemon sees it as connected even though it isn't doing
+// anything. Symptoms (per issue #26): the plugin pegs a CPU core but
+// neither sends nor receives messages.
+//
+// Detect: a connected plugin that has been silent for >= HANG_SILENCE_MS
+// AND whose process is currently consuming >= HANG_CPU_THRESHOLD percent
+// of one core is presumed hung and SIGKILL'd. Daemon's socket close fires
+// next, normal cleanup runs.
+
+const HANG_SILENCE_MS = 5 * 60_000
+const HANG_CPU_THRESHOLD = 80
+
+function pidCpuPercent(pid: number): number | null {
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', '%cpu='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const value = parseFloat(out.trim())
+    return Number.isFinite(value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+function reapHungPlugins(): void {
+  const now = Date.now()
+  for (const state of channels.values()) {
+    for (const socket of state.sockets) {
+      if (socket.destroyed) continue
+      const pid = state.socketPids.get(socket)
+      if (pid == null) continue
+      const last = state.socketLastActivity.get(socket) ?? now
+      const silentMs = now - last
+      if (silentMs < HANG_SILENCE_MS) continue
+      const cpu = pidCpuPercent(pid)
+      if (cpu == null || cpu < HANG_CPU_THRESHOLD) continue
+      try {
+        process.kill(pid, 'SIGKILL')
+        log(state.config.name, `reaped hung plugin pid=${pid} cpu=${cpu.toFixed(1)}% silent=${Math.round(silentMs / 60_000)}m`)
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code !== 'ESRCH') {
+          log(state.config.name, `failed to reap hung plugin pid=${pid}: ${err}`)
+        }
+      }
+    }
+  }
+}
+
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 
 let shuttingDown = false
@@ -1227,5 +1405,7 @@ for (const config of initialChannels) {
 }
 
 setInterval(rescanChannels, SCAN_INTERVAL)
+setInterval(reapOrphanPlugins, REAPER_INTERVAL_MS)
+setInterval(reapHungPlugins, REAPER_INTERVAL_MS)
 
 logGlobal('daemon ready')

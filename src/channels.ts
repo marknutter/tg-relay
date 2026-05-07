@@ -16,7 +16,7 @@ export type ChannelConfig = {
   socketPath: string     // unix socket path for IPC
 }
 
-const CHANNELS_ROOT = join(homedir(), '.claude', 'channels')
+const CHANNELS_ROOT = process.env.TG_RELAY_CHANNELS_ROOT ?? join(homedir(), '.claude', 'channels')
 
 export function discoverChannels(): ChannelConfig[] {
   const channels: ChannelConfig[] = []
