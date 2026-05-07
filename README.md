@@ -126,6 +126,7 @@ For heartbeats that must survive session closes, keep the session alive in tmux 
 | `TG_RELAY_LOG` | Log file path | `~/.claude/channels/telegram-router.log` |
 | `TG_RELAY_CHANNELS_ROOT` | Base dir for channel configs | `~/.claude/channels` |
 | `TG_RELAY_SCAN_INTERVAL` | Seconds between channel dir rescans | `30` |
+| `TG_RELAY_REPLAY_CAP` | Max number of pending messages replayed onto a freshly-bound socket. Older entries stay on disk and are summarized in a single elided-notice message. | `50` |
 | `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
 
 ## Development
@@ -144,4 +145,6 @@ bun src/plugin.ts   # Run plugin standalone (for testing socket connection)
 | `process.exit()` fails in Bun → zombie | launchd detects exit and restarts within 5s (ThrottleInterval) |
 | Multiple sessions fight over PID file | Daemon is the only poller; no PID files needed |
 | `TELEGRAM_STATE_DIR` not propagated | Plugin resolves channel from parent cwd; no env var needed |
-| Claude Code compact → MCP server state lost | Plugin reconnects; daemon buffered any missed messages |
+| Claude Code compact → MCP server state lost | Plugin reconnects; daemon replays unread messages from `pending/` on disk |
+| Daemon restart loses in-flight message buffer | Pending messages persist to `~/.claude/channels/<name>/pending/<seq>.json` and replay on next bind |
+| Plugin zombie window swallows messages | Daemon writes to `pending/` first, then broadcasts; missed messages survive the zombie's death |

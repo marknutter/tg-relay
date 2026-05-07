@@ -28,6 +28,14 @@ export type InboundMessage = {
   heartbeat?: {
     name: string
   }
+  /**
+   * Per-channel monotonic sequence stamped by the daemon when a message
+   * is persisted to the pending queue (issue #25). Plugins ack each
+   * received message by sending `{ type: 'message_ack', seq }` so the
+   * daemon can delete the on-disk copy. Absent on heartbeats and other
+   * non-persisted synthetic messages.
+   */
+  seq?: string
 }
 
 export type InboundPermissionRequest = {
@@ -98,6 +106,16 @@ export type ForwardPermissionRequest = {
   input_preview: string
 }
 
+/**
+ * Acknowledgement of a persisted inbound message (issue #25). Sent by
+ * the plugin after the MCP notification for that message has been
+ * emitted. The daemon deletes the corresponding pending file on receipt.
+ */
+export type OutboundMessageAck = {
+  type: 'message_ack'
+  seq: string
+}
+
 export type PluginToDaemon =
   | OutboundReply
   | OutboundReact
@@ -105,6 +123,7 @@ export type PluginToDaemon =
   | OutboundDownload
   | OutboundPermissionReply
   | ForwardPermissionRequest
+  | OutboundMessageAck
 
 // ── Control messages (bidirectional) ─────────────────────────────────────
 

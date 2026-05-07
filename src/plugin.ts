@@ -451,6 +451,13 @@ function handleDaemonMessage(raw: string): void {
           content: msg.text,
           meta,
         },
+      }).then(() => {
+        // Ack to the daemon so the persisted pending file is deleted
+        // (issue #25). Heartbeat messages have no seq — they're
+        // synthetic and not buffered to disk.
+        if (msg.seq) {
+          socketWrite(JSON.stringify({ type: 'message_ack', seq: msg.seq }) + '\n')
+        }
       }).catch(err => {
         process.stderr.write(`tg-relay plugin: failed to emit notification: ${err}\n`)
       })

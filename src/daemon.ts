@@ -29,10 +29,11 @@ import { discoverChannels, type ChannelConfig } from './channels.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
+import { openPending, buildReplay, type PendingHandle } from './pending.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
-  ForwardPermissionRequest,
+  ForwardPermissionRequest, OutboundMessageAck,
 } from './protocol.js'
 import net from 'net'
 import { execFileSync } from 'child_process'
@@ -44,6 +45,11 @@ const CHANNELS_ROOT = process.env.TG_RELAY_CHANNELS_ROOT ?? join(HOME, '.claude'
 const LOG_FILE = process.env.TG_RELAY_LOG ?? join(CHANNELS_ROOT, 'telegram-router.log')
 const SCAN_INTERVAL = parseInt(process.env.TG_RELAY_SCAN_INTERVAL ?? '30', 10) * 1000
 const MESSAGE_BUFFER_CAP = 100
+// Maximum number of pending messages to replay onto a freshly-bound socket
+// (issue #25). Older entries beyond the cap stay on disk and are replaced
+// in the wire stream by a single elided-summary message so the session
+// knows it missed a backlog.
+const REPLAY_CAP = parseInt(process.env.TG_RELAY_REPLAY_CAP ?? '50', 10)
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
@@ -333,7 +339,20 @@ type ChannelState = {
    * by SIGKILL (issue #26).
    */
   socketLastActivity: Map<net.Socket, number>
+  /**
+   * In-memory buffer for short-lived non-message payloads (permission
+   * decisions, etc.) when no plugin is connected. Inbound text/voice/
+   * attachment messages no longer use this buffer — they go through
+   * `pending` instead, which survives daemon restart (issue #25).
+   */
   buffer: DaemonToPlugin[]
+  /**
+   * On-disk queue of inbound messages awaiting plugin acknowledgement
+   * (issue #25). Replaces the in-memory backlog for InboundMessage so a
+   * daemon crash, plugin zombie window, or session gap doesn't drop
+   * unread Telegram messages from the user's perspective.
+   */
+  pending: PendingHandle
   approvalTimer: ReturnType<typeof setInterval>
   heartbeats: Map<string, HeartbeatSchedule>
 }
@@ -365,31 +384,54 @@ function writeToSocket(socket: net.Socket, msg: unknown): void {
 }
 
 /**
- * Broadcast to every live plugin socket. Used for inbound Telegram
- * messages and permission decisions — both are "everyone watching the
- * channel should see this" events.
+ * Broadcast to every live plugin socket. Inbound Telegram messages get
+ * persisted to the pending queue first so a daemon restart, zombie
+ * plugin, or session gap can't drop them silently (issue #25). Other
+ * DaemonToPlugin payloads (permission decisions, etc.) are time-bound
+ * and use the in-memory buffer when no socket is live.
  */
 function broadcastToPlugins(state: ChannelState, msg: DaemonToPlugin): void {
+  let outgoing = msg
+  if (msg.type === 'message') {
+    const seq = state.pending.append(msg)
+    outgoing = { ...msg, seq }
+  }
+
   const live = liveSockets(state)
   if (live.length === 0) {
-    if (state.buffer.length < MESSAGE_BUFFER_CAP) {
+    if (msg.type !== 'message' && state.buffer.length < MESSAGE_BUFFER_CAP) {
       state.buffer.push(msg)
     }
     return
   }
-  for (const s of live) writeToSocket(s, msg)
+  for (const s of live) writeToSocket(s, outgoing)
 }
 
 // Keep the old name as an alias so existing call sites read naturally.
 const sendToPlugin = broadcastToPlugins
 
 /**
- * Drain the per-channel buffer onto a single newly-connected socket.
- * Called once on Hello so the first session to (re)connect gets the
- * backlog — not every socket on every send.
+ * On Hello, replay the pending message queue onto the new socket and
+ * drain the in-memory buffer of non-message payloads. Replay is capped
+ * at REPLAY_CAP entries; anything older becomes a single elided-summary
+ * synthetic message so the session knows it missed a backlog. Capped
+ * entries stay on disk and are not deleted by this replay.
  */
-function flushBufferToSocket(state: ChannelState, socket: net.Socket): void {
+function flushBacklogToSocket(state: ChannelState, socket: net.Socket): void {
   if (socket.destroyed) return
+
+  const allPending = state.pending.load()
+  const { messages, elided } = buildReplay(allPending, REPLAY_CAP, {
+    pendingDir: state.pending.dir,
+  })
+  for (const m of messages) writeToSocket(socket, m)
+  if (elided > 0) {
+    log(state.config.name, `replay summary: ${elided} elided of ${allPending.length} pending`)
+  }
+  if (messages.length > 0) {
+    log(state.config.name, `replayed ${messages.length} message(s) on bind (pending=${allPending.length}, elided=${elided})`)
+  }
+
   while (state.buffer.length > 0) {
     const msg = state.buffer.shift()!
     writeToSocket(socket, msg)
@@ -423,7 +465,7 @@ async function handlePluginMessage(
     }
     writeToSocket(socket, ack)
     log(state.config.name, `plugin connected: project=${hello.project} pid=${hello.pid} (sockets=${liveSockets(state).length})`)
-    flushBufferToSocket(state, socket)
+    flushBacklogToSocket(state, socket)
     return
   }
 
@@ -561,6 +603,12 @@ async function handlePluginMessage(
       case 'forward_permission_request': {
         const fpr = msg as ForwardPermissionRequest
         await handlePermissionForward(state, fpr.request_id, fpr.tool_name, fpr.description, fpr.input_preview)
+        break
+      }
+
+      case 'message_ack': {
+        const ack = msg as OutboundMessageAck
+        state.pending.delete(ack.seq)
         break
       }
     }
@@ -972,6 +1020,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
     socketPids: new Map(),
     socketLastActivity: new Map(),
     buffer: [],
+    pending: openPending(config.stateDir),
     approvalTimer: setInterval(() => checkApprovals(bot, config.stateDir, config.name), 5000),
     heartbeats: new Map(),
   }
