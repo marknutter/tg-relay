@@ -22,7 +22,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { existsSync, realpathSync, readFileSync, statSync } from 'fs'
+import { existsSync, realpathSync, readFileSync, statSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, sep, basename } from 'path'
 import { execFileSync } from 'child_process'
@@ -38,24 +38,43 @@ import type {
 
 const HOME = homedir()
 const CHANNELS_ROOT = join(HOME, '.claude', 'channels')
+// Plugin writes lifecycle events directly to the daemon's log file so a
+// post-mortem of orphan accumulation has a record (issue #26). MCP stderr
+// vanishes when the parent Claude Code session exits.
+const ROUTER_LOG = process.env.TG_RELAY_LOG ?? join(CHANNELS_ROOT, 'telegram-router.log')
+
+function logToRouter(msg: string): void {
+  try {
+    appendFileSync(ROUTER_LOG, `[${new Date().toISOString()}] [plugin pid=${process.pid}] ${msg}\n`)
+  } catch {
+    // Best-effort; if the log dir is gone, swallow.
+  }
+}
 const MAX_CHUNK_LIMIT = 4096
 const RECONNECT_BASE = 1000
 const RECONNECT_MAX = 30000
 
 // ── Resolve channel from Claude Code's cwd ──────────────────────────────────
 
-function resolveChannelName(): string | undefined {
-  // Walk from this process up to Claude Code (grandparent).
-  // process.ppid is the bun wrapper; Claude Code is the grandparent.
-  let claudeCodePid: number | undefined
+/**
+ * Walk from this process up to Claude Code (grandparent).
+ * process.ppid is the bun wrapper; Claude Code is the grandparent.
+ * Returned value is stored at module scope and used by the parent-liveness
+ * watchdog to self-shutdown when Claude Code exits.
+ */
+function findClaudeCodePid(): number | undefined {
   try {
     const out = execFileSync('ps', ['-o', 'ppid=', '-p', String(process.ppid)], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     })
     const parsed = parseInt(out.trim(), 10)
-    if (parsed > 1) claudeCodePid = parsed
+    if (parsed > 1) return parsed
   } catch {}
+  return undefined
+}
+
+function resolveChannelName(claudeCodePid: number | undefined): string | undefined {
   if (!claudeCodePid) return undefined
 
   // Get Claude Code's cwd via lsof
@@ -135,7 +154,8 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
-const channelName = resolveChannelName()
+const claudeCodePid = findClaudeCodePid()
+const channelName = resolveChannelName(claudeCodePid)
 const stateDir = channelName ? join(CHANNELS_ROOT, `telegram-${channelName}`) : null
 const socketPath = stateDir ? join(stateDir, 'session.sock') : null
 
@@ -540,22 +560,75 @@ function scheduleReconnect(): void {
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
-function shutdown(): void {
+function shutdown(reason: string = 'unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('tg-relay plugin: shutting down\n')
+  process.stderr.write(`tg-relay plugin: shutting down (reason=${reason})\n`)
+  logToRouter(`shutting down (reason=${reason}, channel=${channelName ?? 'unconfigured'})`)
 
   if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (parentWatchdogTimer) clearInterval(parentWatchdogTimer)
   if (socket && !socket.destroyed) socket.destroy()
 
-  setTimeout(() => process.exit(0), 500)
+  // Give the socket destroy a beat to flush, then exit. If the event loop is
+  // somehow blocked and exit(0) doesn't fire, the SIGKILL fallback below
+  // guarantees the process dies — without it, an orphan with a stuck event
+  // loop pegs CPU forever (issue #26).
+  setTimeout(() => {
+    process.stderr.write('tg-relay plugin: exit(0)\n')
+    logToRouter('exit(0)')
+    process.exit(0)
+  }, 500).unref()
+
+  // Last-resort hard kill 2s after shutdown is requested. .unref() so this
+  // timer doesn't itself keep the process alive past a clean exit.
+  setTimeout(() => {
+    process.stderr.write('tg-relay plugin: shutdown timeout, SIGKILL self\n')
+    logToRouter('shutdown timeout, SIGKILL self')
+    process.kill(process.pid, 'SIGKILL')
+  }, 2000).unref()
+}
+
+// ── Parent-liveness watchdog ────────────────────────────────────────────────
+//
+// Claude Code's exit should propagate to us via stdin EOF / SIGPIPE / MCP
+// transport close. In practice (issue #26) those signals occasionally fail
+// to deliver — bun + closed-pipe edge cases leave the plugin alive after
+// its parent is gone, sometimes pegging CPU at 95%+. This watchdog is the
+// belt-and-suspenders fallback: poll the original Claude Code grandparent
+// PID every 10 seconds, and shut down if it's gone.
+
+const PARENT_CHECK_INTERVAL_MS = 10_000
+let parentWatchdogTimer: ReturnType<typeof setInterval> | null = null
+
+function startParentWatchdog(): void {
+  if (!claudeCodePid) {
+    process.stderr.write('tg-relay plugin: no parent PID resolved at startup; watchdog disabled\n')
+    return
+  }
+  parentWatchdogTimer = setInterval(() => {
+    try {
+      // Signal 0 doesn't deliver a signal, just checks process existence
+      // (and that we have permission to signal it). Throws ESRCH if dead.
+      process.kill(claudeCodePid, 0)
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ESRCH') {
+        process.stderr.write(`tg-relay plugin: parent (Claude Code pid=${claudeCodePid}) is gone; shutting down\n`)
+        shutdown('parent-exit')
+      }
+      // EPERM is unlikely between sibling processes; if it happens, treat as
+      // alive (parent still exists, we just can't probe). No-op.
+    }
+  }, PARENT_CHECK_INTERVAL_MS)
+  parentWatchdogTimer.unref()
 }
 
 // MCP transport
 const transport = new StdioServerTransport()
 transport.onclose = () => {
   process.stderr.write('tg-relay plugin: MCP transport closed\n')
-  shutdown()
+  shutdown('mcp-transport-close')
 }
 mcp.onerror = (err: Error) => {
   process.stderr.write(`tg-relay plugin: MCP error: ${err}\n`)
@@ -566,19 +639,19 @@ await mcp.connect(transport)
 process.stdout.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EPIPE') {
     process.stderr.write('tg-relay plugin: stdout EPIPE, shutting down\n')
-    shutdown()
+    shutdown('stdout-epipe')
   }
 })
 
 // stdin close = session ended
 process.stdin.on('end', () => {
   setTimeout(() => {
-    if (process.stdin.destroyed) shutdown()
+    if (process.stdin.destroyed) shutdown('stdin-end')
   }, 500)
 })
-process.stdin.on('close', shutdown)
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
+process.stdin.on('close', () => shutdown('stdin-close'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
 
 process.on('unhandledRejection', err => {
   process.stderr.write(`tg-relay plugin: unhandled rejection: ${err}\n`)
@@ -590,4 +663,10 @@ process.on('uncaughtException', err => {
 // Start connection to daemon
 connectToSocket()
 
-process.stderr.write(`tg-relay plugin: started (channel=${channelName})\n`)
+// Watchdog must run regardless of whether a channel resolved — even an
+// unconfigured plugin should self-shutdown when its parent exits, otherwise
+// it accumulates as an orphan.
+startParentWatchdog()
+
+process.stderr.write(`tg-relay plugin: started (channel=${channelName} parent=${claudeCodePid})\n`)
+logToRouter(`started (channel=${channelName ?? 'unconfigured'}, parent=${claudeCodePid ?? 'unknown'})`)
