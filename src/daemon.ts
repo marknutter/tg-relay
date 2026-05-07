@@ -29,6 +29,7 @@ import { discoverChannels, type ChannelConfig } from './channels.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
+import { runPollingLoop } from './polling.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -980,50 +981,30 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   setupInboundHandlers(state)
   reconcileHeartbeats(state)
 
-  // Start polling with retry logic
-  void (async () => {
-    for (let attempt = 1; ; attempt++) {
-      if (shuttingDown) return
-      try {
-        await bot.start({
-          onStart: info => {
-            state.botUsername = info.username
-            log(config.name, `polling as @${info.username}`)
-            void bot.api.setMyCommands(
-              [
-                { command: 'start', description: 'Welcome and setup guide' },
-                { command: 'help', description: 'What this bot can do' },
-                { command: 'status', description: 'Check your pairing status' },
-              ],
-              { scope: { type: 'all_private_chats' } },
-            ).catch(() => {})
-          },
-        })
-        return
-      } catch (err) {
-        if (shuttingDown) return
-        if (err instanceof GrammyError && err.error_code === 409) {
-          if (attempt >= 8) {
-            log(config.name, `409 Conflict persists after ${attempt} attempts — giving up`)
-            return
-          }
-          const delay = Math.min(1000 * attempt, 15000)
-          log(config.name, `409 Conflict, retrying in ${delay / 1000}s`)
-          await new Promise(r => setTimeout(r, delay))
-          continue
-        }
-        if (err instanceof Error && err.message === 'Aborted delay') return
-        if (err instanceof GrammyError && (err.error_code === 401 || err.error_code === 404)) {
-          log(config.name, `permanent error ${err.error_code}: ${err.description}`)
-          return
-        }
-        const delay = Math.min(1000 * attempt, 30000)
-        log(config.name, `polling error (transient): ${err}, retrying in ${delay / 1000}s`)
-        await new Promise(r => setTimeout(r, delay))
-        continue
-      }
-    }
-  })()
+  // Start polling with retry logic. See src/polling.ts for the state
+  // machine — 8 fast retries, then long-backoff (60s for 10min, 5min
+  // thereafter) instead of giving up forever (issue #30).
+  void runPollingLoop({
+    start: async (onStart) => {
+      await bot.start({
+        onStart: info => {
+          onStart()
+          state.botUsername = info.username
+          log(config.name, `polling as @${info.username}`)
+          void bot.api.setMyCommands(
+            [
+              { command: 'start', description: 'Welcome and setup guide' },
+              { command: 'help', description: 'What this bot can do' },
+              { command: 'status', description: 'Check your pairing status' },
+            ],
+            { scope: { type: 'all_private_chats' } },
+          ).catch(() => {})
+        },
+      })
+    },
+    log: msg => log(config.name, msg),
+    isShuttingDown: () => shuttingDown,
+  })
 }
 
 // ── Heartbeat firing + reconciliation ───────────────────────────────────────
