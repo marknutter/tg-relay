@@ -31,6 +31,7 @@ import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
 import { openPending, buildReplay, type PendingHandle } from './pending.js'
 import { runPollingLoop } from './polling.js'
+import { stopBotWithTimeout } from './shutdown.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -1114,6 +1115,8 @@ function reconcileHeartbeats(state: ChannelState): void {
 
 // ── Stop a single channel ───────────────────────────────────────────────────
 
+const CHANNEL_STOP_TIMEOUT_MS = parseInt(process.env.TG_RELAY_CHANNEL_STOP_TIMEOUT_MS ?? '4000', 10)
+
 async function stopChannel(name: string): Promise<void> {
   const state = channels.get(name)
   if (!state) return
@@ -1133,10 +1136,17 @@ async function stopChannel(name: string): Promise<void> {
   state.server.close()
   try { unlinkSync(state.config.socketPath) } catch {}
 
-  await Promise.resolve(state.bot.stop()).catch(() => {})
+  log(name, `aborting in-flight getUpdates connection (cleanup)`)
+  const outcome = await stopBotWithTimeout(state.bot, CHANNEL_STOP_TIMEOUT_MS)
+  if (outcome.ok) {
+    log(name, `channel stopped cleanly (${outcome.ms}ms)`)
+  } else if (outcome.reason === 'timeout') {
+    log(name, `channel stop timed out after ${outcome.ms}ms — abort signal sent but confirmation didn't return; may leave a server-side long-poll registered briefly`)
+  } else {
+    log(name, `channel stop errored after ${outcome.ms}ms: ${outcome.error}`)
+  }
 
   channels.delete(name)
-  log(name, 'channel stopped')
 }
 
 // ── Plugin hijack maintenance ───────────────────────────────────────────────
@@ -1441,15 +1451,30 @@ function reapHungPlugins(): void {
 
 let shuttingDown = false
 
+// Cap the entire shutdown to this many ms so launchd's SIGKILL never
+// gets to cancel us mid-cleanup. ExitTimeOut on the plist is set to a
+// larger value so the runtime hits this bound first and exits cleanly.
+const SHUTDOWN_GLOBAL_TIMEOUT_MS = parseInt(process.env.TG_RELAY_SHUTDOWN_TIMEOUT_MS ?? '10000', 10)
+
 async function shutdown(): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
-  logGlobal('shutting down...')
+  const startedAt = Date.now()
+  logGlobal(`shutting down (channels=${channels.size})...`)
 
   const stopPromises = Array.from(channels.keys()).map(name => stopChannel(name))
-  await Promise.allSettled(stopPromises)
+  const allStopped = Promise.allSettled(stopPromises)
+  const timeout = new Promise<'timeout'>(resolve =>
+    setTimeout(() => resolve('timeout'), SHUTDOWN_GLOBAL_TIMEOUT_MS),
+  )
+  const outcome = await Promise.race([allStopped.then(() => 'ok' as const), timeout])
+  const elapsed = Date.now() - startedAt
 
-  logGlobal('shutdown complete')
+  if (outcome === 'timeout') {
+    logGlobal(`shutdown global timeout (${elapsed}ms) — exiting; some channels may not have completed bot.stop()`)
+  } else {
+    logGlobal(`shutdown complete (${elapsed}ms)`)
+  }
   process.exit(0)
 }
 
