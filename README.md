@@ -86,7 +86,19 @@ The daemon picks up new channels automatically — no restart needed.
 
 1. Walk up from project root looking for a `.claude-channel` file
 2. Match directory basename against `~/.claude/channels/telegram-{name}/`
-3. If neither matches, the plugin runs but stays unconfigured — Telegram tools return an error and no socket connection is made. This keeps utility sessions (home directory, unrelated repos) from squatting on a channel.
+3. If neither matches, the plugin runs but stays unconfigured — Telegram tools return an error explaining the specific failure (no marker file found, marker present but channel dir missing, lsof failed to read the parent cwd, etc.) and no socket connection is made. The reason is also written to `telegram-router.log` so the daemon-side log captures *why* a session failed to bind.
+
+### Multiple sessions per channel
+
+Two or more Claude Code sessions can target the same channel concurrently — e.g. two worktrees of the same project, a tmux session and a zellij session running side by side, or a resumed session that overlaps briefly with the original. The daemon is **fan-out**, not exclusive-bind:
+
+- Both sessions connect to the same `session.sock` and both receive every inbound Telegram message
+- Outbound replies/reactions/edits from any session go through equally — Telegram has no concept of "which session sent it"
+- Per-channel buffered messages (sent while no plugin was connected) are flushed onto whichever session Hellos first; subsequent sessions do not get the backlog (see issue #25 for the persistent-replay variant)
+- Heartbeats fire to exactly one session — the most-recently-connected — so a scheduled prompt doesn't trigger duplicate work in every live session
+- When one session exits, the others keep working without intervention. When a session crashes without a clean disconnect, the daemon's orphan reaper (issue #26) cleans up the dead socket within ~5 minutes
+
+If you want strict single-session-per-channel semantics, kill the older session before starting the new one. There is no automatic handoff or eviction.
 
 ### Scheduled heartbeats
 

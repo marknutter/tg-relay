@@ -24,7 +24,7 @@ import {
 import { z } from 'zod'
 import { existsSync, realpathSync, readFileSync, statSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
-import { join, dirname, sep, basename } from 'path'
+import { join, sep } from 'path'
 import { execFileSync } from 'child_process'
 import net from 'net'
 import type {
@@ -33,6 +33,7 @@ import type {
   OutboundReply, OutboundReact, OutboundEdit, OutboundDownload,
   ForwardPermissionRequest,
 } from './protocol.js'
+import { resolveChannel, type ChannelResolution } from './resolve.js'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -74,46 +75,17 @@ function findClaudeCodePid(): number | undefined {
   return undefined
 }
 
-function resolveChannelName(claudeCodePid: number | undefined): string | undefined {
-  if (!claudeCodePid) return undefined
-
-  // Get Claude Code's cwd via lsof
-  let parentCwd: string | undefined
+function readParentCwdViaLsof(pid: number): string | undefined {
   try {
-    const out = execFileSync('lsof', ['-a', '-p', String(claudeCodePid), '-d', 'cwd', '-Fn'], {
+    const out = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     })
     const m = out.match(/^n(\/.*)$/m)
-    if (m) parentCwd = m[1]
-  } catch {}
-  if (!parentCwd) return undefined
-
-  // Walk up from parentCwd looking for .claude-channel
-  let dir: string = parentCwd
-  while (dir && dir.startsWith(HOME) && dir !== HOME) {
-    const channelFile = join(dir, '.claude-channel')
-    if (existsSync(channelFile)) {
-      try {
-        const name = readFileSync(channelFile, 'utf8').trim()
-        if (name && existsSync(join(CHANNELS_ROOT, `telegram-${name}`))) {
-          return name
-        }
-      } catch {}
-      break
-    }
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
+    return m ? m[1] : undefined
+  } catch {
+    return undefined
   }
-
-  // Basename auto-match
-  const base = parentCwd.split('/').pop()
-  if (base && existsSync(join(CHANNELS_ROOT, `telegram-${base}`))) {
-    return base
-  }
-
-  return undefined
 }
 
 
@@ -155,15 +127,27 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const claudeCodePid = findClaudeCodePid()
-const channelName = resolveChannelName(claudeCodePid)
+const resolution: ChannelResolution = resolveChannel({
+  claudeCodePid,
+  readParentCwd: readParentCwdViaLsof,
+  channelsRoot: CHANNELS_ROOT,
+  homeDir: HOME,
+  pathExists: existsSync,
+  readFile: p => {
+    try { return readFileSync(p, 'utf8') } catch { return undefined }
+  },
+})
+const channelName = resolution.ok ? resolution.name : undefined
+const resolutionReason = resolution.ok ? undefined : resolution.reason
 const stateDir = channelName ? join(CHANNELS_ROOT, `telegram-${channelName}`) : null
 const socketPath = stateDir ? join(stateDir, 'session.sock') : null
 
-if (channelName) {
+if (resolution.ok) {
   process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)
+  logToRouter(`resolved channel='${channelName}' parent=${claudeCodePid ?? 'unknown'}`)
 } else {
-  process.stderr.write(`tg-relay plugin: no channel matched for this session (no .claude-channel file, no basename match). ` +
-    `Running MCP server but skipping socket connection — Telegram tools will return an error if called.\n`)
+  process.stderr.write(`tg-relay plugin: ${resolution.reason}. Running MCP server but skipping socket connection — Telegram tools will return this reason if called.\n`)
+  logToRouter(`channel resolution failed: ${resolution.reason}`)
 }
 
 const mcp = new Server(
@@ -294,8 +278,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
 
   if (!channelName || !stateDir) {
+    const reason = resolutionReason ?? 'no Telegram channel configured for this session'
     return {
-      content: [{ type: 'text', text: `${req.params.name} failed: no Telegram channel configured for this session. Add a .claude-channel file or start the session from a directory matching a channel name.` }],
+      content: [{ type: 'text', text: `${req.params.name} failed: ${reason}` }],
       isError: true,
     }
   }
