@@ -257,72 +257,185 @@ await new Promise(() => {})
   expect(pluginExited).toBe(true)
 }, 45_000)
 
-// ── T5: daemon reaps orphan plugin ────────────────────────────────────────
+// ── Helpers shared by T5 / T6 ────────────────────────────────────────────
 
-test('T5: daemon SIGKILLs orphan plugin processes after grace period', async () => {
+/**
+ * Boot a tg-relay daemon with a hermetic channels root and aggressive
+ * reaper timing so tests can exercise the orphan-reaper path in seconds
+ * instead of minutes. Returns the running subprocess; caller must track()
+ * it for cleanup.
+ */
+function spawnTestDaemon(opts: { tmp: string; logFile: string; channelsRoot: string }) {
+  return Bun.spawn(['bun', 'src/daemon.ts'], {
+    cwd: REPO_ROOT,
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {
+      ...process.env,
+      TG_RELAY_CHANNELS_ROOT: opts.channelsRoot,
+      TG_RELAY_LOG: opts.logFile,
+      TG_RELAY_SCAN_INTERVAL: '5',
+      // Aggressive reaper timing for tests: tick every 1s, kill orphans
+      // 2s after they're first noticed. Real defaults are 30s / 5min.
+      TG_RELAY_REAPER_INTERVAL_MS: '1000',
+      TG_RELAY_REAPER_GRACE_MS: '2000',
+    },
+  })
+}
+
+// ── T5: daemon reaps a genuinely orphaned plugin ──────────────────────────
+//
+// "Genuinely orphaned" = parent process has died and the plugin has been
+// reparented (ppid <= 1). This is the only condition that should provoke
+// the reaper to act, after #29 (the original implementation also reaped
+// healthy plugins whose Hello hadn't yet arrived).
+
+test('T5: daemon SIGKILLs an orphan plugin (parent dead, ppid reparented)', async () => {
   const tmp = mkdtempSync(join(tmpdir(), 'tgrelay-t5-'))
   const channelsRoot = join(tmp, 'channels')
   const logFile = join(tmp, 'router.log')
-  // Empty channels root — daemon's reaper must still run without channels.
-  writeFileSync(join(tmp, 'channels-marker'), '') // ensure tmp exists
-  // Make channelsRoot
+  const pidFile = join(tmp, 'plugin.pid')
   Bun.spawnSync(['mkdir', '-p', channelsRoot])
 
   const daemon = track(
-    Bun.spawn(['bun', 'src/daemon.ts'], {
-      cwd: REPO_ROOT,
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: {
-        ...process.env,
-        TG_RELAY_CHANNELS_ROOT: channelsRoot,
-        TG_RELAY_LOG: logFile,
-        TG_RELAY_SCAN_INTERVAL: '5',
-      },
-    }),
+    spawnTestDaemon({ tmp, logFile, channelsRoot }),
     'daemon-t5',
   )
+  await sleep(1500)
 
-  await sleep(2000) // let daemon start
+  // Intermediate: spawns the plugin, writes its pid, then exits. The
+  // plugin's direct parent (this script) dies and the plugin is
+  // reparented to launchd/init — exactly the condition the reaper should
+  // detect. TG_RELAY_TEST_DISABLE_STDIN_SHUTDOWN keeps the plugin alive
+  // even though the stdin pipe closes when this intermediate exits;
+  // otherwise the plugin self-exits before the reaper has a chance.
+  const intermediateScript = join(tmp, 'intermediate.ts')
+  writeFileSync(
+    intermediateScript,
+    `
+import { writeFileSync } from 'node:fs'
+const proc = Bun.spawn(['bun', 'src/plugin.ts'], {
+  cwd: ${JSON.stringify(REPO_ROOT)},
+  stdin: 'pipe',
+  stdout: 'ignore',
+  stderr: 'ignore',
+  env: { ...process.env, TG_RELAY_TEST_DISABLE_STDIN_SHUTDOWN: '1' },
+})
+writeFileSync(${JSON.stringify(pidFile)}, String(proc.pid))
+// Detach: don't wait, exit immediately so plugin becomes orphan.
+process.exit(0)
+`,
+  )
 
-  // Spawn an orphan plugin: it appears in `ps` as `bun .../src/plugin.ts`
-  // but is not connected to any daemon socket session, so it's reapable.
-  // Keep stdin piped (open) so plugin doesn't exit on stdin EOF.
-  const orphan = track(spawnPlugin({ stdin: 'pipe' }), 'orphan-t5')
-  const orphanPid = orphan.pid
+  const intermediate = Bun.spawn(['bun', intermediateScript], {
+    cwd: REPO_ROOT,
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: process.env,
+  })
+  await intermediate.exited
 
-  // First reaper kill is at ~REAPER_INTERVAL_MS + GRACE_MS ≈ 60s.
-  // Allow up to 90s. Use the subprocess's `.exited` promise rather than
-  // polling `kill(pid, 0)` — once SIGKILL'd by the daemon, the orphan
-  // becomes a zombie waiting for our (the test runner's) wait(); the
-  // kernel keeps the PID alive for that purpose, so kill(pid, 0) still
-  // succeeds. `.exited` resolves on actual process termination.
-  const exitResult = await Promise.race([
-    orphan.exited.then(() => 'exited' as const),
-    new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 90_000)),
-  ])
-  const reaped = exitResult === 'exited'
+  // Read the plugin pid the intermediate wrote.
+  let orphanPid: number | undefined
+  for (let i = 0; i < 25; i++) {
+    if (existsSync(pidFile)) {
+      const v = parseInt(readFileSync(pidFile, 'utf8').trim(), 10)
+      if (Number.isFinite(v) && v > 0) {
+        orphanPid = v
+        break
+      }
+    }
+    await sleep(100)
+  }
+  expect(orphanPid).toBeDefined()
+  if (!orphanPid) throw new Error('did not get orphan plugin pid')
 
-  // Read daemon log for the reaper line.
-  let logContents = ''
-  try {
-    logContents = readFileSync(logFile, 'utf8')
-  } catch {
-    /* log may not exist if daemon never wrote */
+  // Reaper should kill within ~3s of the intermediate exiting (1s tick + 2s grace).
+  // Allow 15s for safety. Poll via `kill(pid, 0)` — the orphan was reparented to
+  // init, which DOES reap zombies, so kill(pid, 0) accurately reflects death here.
+  const deadline = Date.now() + 15_000
+  let killed = false
+  while (Date.now() < deadline) {
+    try {
+      process.kill(orphanPid, 0)
+    } catch {
+      killed = true
+      break
+    }
+    await sleep(250)
   }
 
-  // Cleanup before assertions
+  // Make sure we don't leak a still-running orphan.
+  if (!killed) {
+    try { process.kill(orphanPid, 9) } catch {}
+  }
+
+  let logContents = ''
+  try { logContents = readFileSync(logFile, 'utf8') } catch {}
+
   daemon.kill('SIGKILL')
   await waitForExit(daemon, 3000)
 
-  // For diagnostics on failure, surface log contents.
-  if (!reaped) {
-    console.error('[T5] daemon log contents:\n' + logContents.slice(-2000))
+  if (!killed) {
+    console.error('[T5] daemon log:\n' + logContents.slice(-2000))
   }
 
   try { rmSync(tmp, { recursive: true, force: true }) } catch {}
 
-  expect(reaped).toBe(true)
+  expect(killed).toBe(true)
   expect(logContents).toMatch(/reaped orphan plugin/i)
-}, 120_000)
+  expect(logContents).toMatch(/reparented to init|no longer exists/)
+}, 30_000)
+
+// ── T6: connected plugin with live parent is NEVER reaped ─────────────────
+//
+// Regression test for #29. Earlier versions of the reaper killed any
+// `bun src/plugin.ts` PID not in the connected set after a 30s grace,
+// which silently murdered freshly-started healthy plugins.
+
+test('T6: a plugin with a living parent is not reaped (regression for #29)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'tgrelay-t6-'))
+  const channelsRoot = join(tmp, 'channels')
+  const logFile = join(tmp, 'router.log')
+  Bun.spawnSync(['mkdir', '-p', channelsRoot])
+
+  const daemon = track(
+    spawnTestDaemon({ tmp, logFile, channelsRoot }),
+    'daemon-t6',
+  )
+  await sleep(1500)
+
+  // Plugin is a direct child of this test runner — bun:test process is
+  // alive throughout, so the plugin's ppid is never reparented and the
+  // reaper must leave it alone.
+  const plugin = track(spawnPlugin({ stdin: 'pipe' }), 'plugin-t6')
+  const pluginPid = plugin.pid
+
+  // Wait several reaper cycles: 1s tick + 2s grace = ~3s minimum to reap.
+  // Sleeping 8s = at least 6 ticks. If the reaper is still buggy this is
+  // plenty of time to demonstrate it.
+  await sleep(8000)
+
+  const stillAlive = await pidAlive(pluginPid)
+
+  // Tear down before assertions.
+  plugin.kill('SIGTERM')
+  await waitForExit(plugin, 3000)
+  daemon.kill('SIGKILL')
+  await waitForExit(daemon, 3000)
+
+  let logContents = ''
+  try { logContents = readFileSync(logFile, 'utf8') } catch {}
+
+  if (!stillAlive) {
+    console.error('[T6] daemon log:\n' + logContents.slice(-2000))
+  }
+
+  try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+
+  expect(stillAlive).toBe(true)
+  // And we should NOT see this PID listed in any reaped-orphan log line.
+  expect(logContents).not.toMatch(new RegExp(`reaped orphan plugin pid=${pluginPid}`))
+}, 30_000)

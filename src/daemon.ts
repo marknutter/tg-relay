@@ -30,6 +30,7 @@ import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
 import { openPending, buildReplay, type PendingHandle } from './pending.js'
+import { runPollingLoop } from './polling.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -1029,50 +1030,30 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   setupInboundHandlers(state)
   reconcileHeartbeats(state)
 
-  // Start polling with retry logic
-  void (async () => {
-    for (let attempt = 1; ; attempt++) {
-      if (shuttingDown) return
-      try {
-        await bot.start({
-          onStart: info => {
-            state.botUsername = info.username
-            log(config.name, `polling as @${info.username}`)
-            void bot.api.setMyCommands(
-              [
-                { command: 'start', description: 'Welcome and setup guide' },
-                { command: 'help', description: 'What this bot can do' },
-                { command: 'status', description: 'Check your pairing status' },
-              ],
-              { scope: { type: 'all_private_chats' } },
-            ).catch(() => {})
-          },
-        })
-        return
-      } catch (err) {
-        if (shuttingDown) return
-        if (err instanceof GrammyError && err.error_code === 409) {
-          if (attempt >= 8) {
-            log(config.name, `409 Conflict persists after ${attempt} attempts — giving up`)
-            return
-          }
-          const delay = Math.min(1000 * attempt, 15000)
-          log(config.name, `409 Conflict, retrying in ${delay / 1000}s`)
-          await new Promise(r => setTimeout(r, delay))
-          continue
-        }
-        if (err instanceof Error && err.message === 'Aborted delay') return
-        if (err instanceof GrammyError && (err.error_code === 401 || err.error_code === 404)) {
-          log(config.name, `permanent error ${err.error_code}: ${err.description}`)
-          return
-        }
-        const delay = Math.min(1000 * attempt, 30000)
-        log(config.name, `polling error (transient): ${err}, retrying in ${delay / 1000}s`)
-        await new Promise(r => setTimeout(r, delay))
-        continue
-      }
-    }
-  })()
+  // Start polling with retry logic. See src/polling.ts for the state
+  // machine — 8 fast retries, then long-backoff (60s for 10min, 5min
+  // thereafter) instead of giving up forever (issue #30).
+  void runPollingLoop({
+    start: async (onStart) => {
+      await bot.start({
+        onStart: info => {
+          onStart()
+          state.botUsername = info.username
+          log(config.name, `polling as @${info.username}`)
+          void bot.api.setMyCommands(
+            [
+              { command: 'start', description: 'Welcome and setup guide' },
+              { command: 'help', description: 'What this bot can do' },
+              { command: 'status', description: 'Check your pairing status' },
+            ],
+            { scope: { type: 'all_private_chats' } },
+          ).catch(() => {})
+        },
+      })
+    },
+    log: msg => log(config.name, msg),
+    isShuttingDown: () => shuttingDown,
+  })
 }
 
 // ── Heartbeat firing + reconciliation ───────────────────────────────────────
@@ -1262,22 +1243,33 @@ function rescanChannels(): void {
 // ── Orphan plugin reaper ────────────────────────────────────────────────────
 //
 // Defense-in-depth for issue #26. Even with the plugin's own parent-liveness
-// watchdog, edge cases (event loop blocked, kernel quirks) can leave plugin
-// processes alive after their parent Claude Code session exits. The daemon
-// is the natural place to catch these because it already knows which plugin
-// PIDs are legitimately connected (from Hello messages) and has a stable
-// long-running lifecycle to host the reaper.
+// watchdog, edge cases can leave plugin processes alive after their parent
+// Claude Code session exits.
 //
-// Strategy: every REAPER_INTERVAL_MS, list all `bun .../src/plugin.ts`
-// processes via `ps`. Any PID *not* currently connected to any channel and
-// continuously unaccounted for >= REAPER_GRACE_MS is SIGKILL'd. The grace
-// period spares plugins that just spawned and haven't sent Hello yet.
+// Liveness model (after #29 — earlier "unaccounted set" version reaped
+// healthy plugins whose Hello had not yet arrived):
+//
+//   1. Plugins with an active socket connection to the daemon are NEVER
+//      reaped, regardless of age. Hello populates state.socketPids; that
+//      set is consulted on every reaper tick.
+//
+//   2. For plugins not in the connected set, the reaper inspects the OS
+//      process tree: a plugin whose ppid still points at a live process
+//      is presumed-healthy. Only plugins that have been reparented (ppid
+//      is launchd / init / a dead pid) are candidates for reaping.
+//
+//   3. Genuine orphans are tracked over time and SIGKILL'd after
+//      REAPER_GRACE_MS — defaulting to 5 minutes so a slow Hello, a brief
+//      daemon outage, or any other transient connectivity hiccup doesn't
+//      kill a healthy plugin.
 
-const REAPER_INTERVAL_MS = 30_000
-const REAPER_GRACE_MS = 30_000
+const REAPER_INTERVAL_MS = parseInt(process.env.TG_RELAY_REAPER_INTERVAL_MS ?? '30000', 10)
+const REAPER_GRACE_MS = parseInt(process.env.TG_RELAY_REAPER_GRACE_MS ?? '300000', 10)
 
-/** PID -> first ts (ms) we noticed this PID running but unaccounted-for. */
-const unaccountedFirstSeen = new Map<number, number>()
+type OrphanCandidate = { firstSeen: number; reason: string }
+
+/** PID -> when we first observed it as a genuine orphan, plus why. */
+const orphanCandidates = new Map<number, OrphanCandidate>()
 
 function connectedPluginPids(): Set<number> {
   const pids = new Set<number>()
@@ -1288,17 +1280,16 @@ function connectedPluginPids(): Set<number> {
 }
 
 /**
- * Returns the set of PIDs currently running our plugin.ts via bun. Matches
- * either the absolute path (how production / install.sh launches it) or
- * the trailing `src/plugin.ts` (how `bun src/plugin.ts` from cwd=repo
- * appears in `ps` — relative path). Combined with a `bun` token in the
- * command line, this only catches our own plugin processes.
+ * Snapshot of PID and PPID for every running `bun .../src/plugin.ts`
+ * process. Matches either the absolute install.sh path or the relative
+ * `src/plugin.ts` tail (how `bun src/plugin.ts` from cwd=repo appears in
+ * `ps`). The `bun` token requirement avoids matching unrelated files.
  */
-function findRunningPluginPids(): Set<number> {
-  const pids = new Set<number>()
+function findRunningPlugins(): Map<number, number> {
+  const pids = new Map<number, number>()
   let raw: string
   try {
-    raw = execFileSync('ps', ['-axo', 'pid=,command='], {
+    raw = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     })
@@ -1309,52 +1300,85 @@ function findRunningPluginPids(): Set<number> {
   for (const line of raw.split('\n')) {
     const trimmed = line.trim()
     if (!trimmed) continue
-    // Must match either the absolute install.sh path, or contain the
-    // src/plugin.ts tail (with src/ prefix to avoid catching unrelated
-    // files named plugin.ts elsewhere in the system).
     const matchesEntry = trimmed.includes(PLUGIN_ENTRY) || trimmed.includes(PLUGIN_TAIL)
     if (!matchesEntry) continue
     if (!trimmed.includes('bun')) continue
-    const m = trimmed.match(/^(\d+)\s/)
+    const m = trimmed.match(/^(\d+)\s+(\d+)\s/)
     if (!m) continue
     const pid = parseInt(m[1]!, 10)
+    const ppid = parseInt(m[2]!, 10)
     if (pid === process.pid) continue
-    pids.add(pid)
+    pids.set(pid, ppid)
   }
   return pids
 }
 
+/**
+ * Decide whether an unconnected plugin is a genuine orphan (parent is
+ * gone) or just hasn't connected yet (parent still alive).
+ *
+ * Returns null if the plugin appears healthy. Returns a string reason if
+ * it qualifies as an orphan.
+ */
+function classifyAsOrphan(ppid: number): string | null {
+  // ppid <= 1 means the process has been reparented to init/launchd —
+  // its real parent died, the kernel adopted it.
+  if (ppid <= 1) return `ppid=${ppid} (reparented to init)`
+  try {
+    process.kill(ppid, 0)
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return `ppid=${ppid} no longer exists`
+    // EPERM means the parent exists but we can't signal it — still
+    // alive. Anything else, be conservative and treat as alive.
+  }
+  return null
+}
+
 function reapOrphanPlugins(): void {
-  const running = findRunningPluginPids()
+  const running = findRunningPlugins()
   const connected = connectedPluginPids()
   const now = Date.now()
 
-  // Forget any PIDs that have either reconnected or actually died.
-  for (const pid of unaccountedFirstSeen.keys()) {
-    if (connected.has(pid) || !running.has(pid)) {
-      unaccountedFirstSeen.delete(pid)
+  // Forget candidates that have either connected since, or actually
+  // exited, or now have a live parent again (rare but possible if ppid
+  // was momentarily 1 due to a transient ps glitch).
+  for (const pid of orphanCandidates.keys()) {
+    if (!running.has(pid)) {
+      orphanCandidates.delete(pid)
+      continue
+    }
+    if (connected.has(pid)) {
+      orphanCandidates.delete(pid)
+      continue
+    }
+    const ppid = running.get(pid)!
+    if (classifyAsOrphan(ppid) == null) {
+      orphanCandidates.delete(pid)
     }
   }
 
-  for (const pid of running) {
+  for (const [pid, ppid] of running) {
     if (connected.has(pid)) continue
-    const firstSeen = unaccountedFirstSeen.get(pid)
-    if (firstSeen == null) {
-      unaccountedFirstSeen.set(pid, now)
+    const reason = classifyAsOrphan(ppid)
+    if (reason == null) continue
+    const existing = orphanCandidates.get(pid)
+    if (existing == null) {
+      orphanCandidates.set(pid, { firstSeen: now, reason })
       continue
     }
-    const ageMs = now - firstSeen
+    const ageMs = now - existing.firstSeen
     if (ageMs < REAPER_GRACE_MS) continue
     try {
       process.kill(pid, 'SIGKILL')
-      logGlobal(`reaped orphan plugin pid=${pid} age=${Math.round(ageMs / 1000)}s`)
+      logGlobal(`reaped orphan plugin pid=${pid} reason="${existing.reason}" age=${Math.round(ageMs / 1000)}s`)
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException).code
       if (code !== 'ESRCH') {
         logGlobal(`failed to reap orphan plugin pid=${pid}: ${err}`)
       }
     }
-    unaccountedFirstSeen.delete(pid)
+    orphanCandidates.delete(pid)
   }
 }
 
