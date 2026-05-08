@@ -1,44 +1,45 @@
 /**
- * Unit tests for issue #24 — channel resolver.
+ * Unit tests for the channel resolver (issues #24, #43).
  *
- * Tests `resolveChannel` from src/resolve.ts as a black box. All deps are
- * injected via the `ResolveDeps` object: the parent-cwd lookup, filesystem
- * existence checks, file reading, the Claude Code pid, the channels root,
- * and the user's home directory. No real fs / process tree is touched.
+ * Tests `resolveChannel` and `resolveChannelFromCandidates` from
+ * src/resolve.ts as a black box. All deps are injected: filesystem
+ * existence checks, file reading, channels root, home directory, and
+ * the cwd(s) to walk. No real fs / process tree is touched.
  *
- * The acceptance criteria we verify here come straight from the issue:
- *   1) missing claudeCodePid                        → ok:false (mentions pid)
- *   2) readParentCwd returns undefined              → ok:false (mentions lsof / cwd / pid)
- *   3) no marker, basename matches a channel        → ok:true, name = basename
- *   4) no marker, basename does NOT match           → ok:false (mentions basename + missing dir)
- *   5) marker valid, channel dir exists             → ok:true, name = marker contents
- *   6) marker valid, channel dir missing            → ok:false (names channel + tells user how to add)
- *   7) marker present but empty/whitespace          → ok:false (mentions empty)
- *   8) marker present but readFile returns undefined→ ok:false (mentions could not be read)
- *   9) walk stops at homeDir                        → never consults markers above homeDir
- *  10) marker found short-circuits the walk         → deeper marker wins, ancestor not consulted
+ * Acceptance criteria covered (#24 and #43):
+ *   1) empty cwd                                    → ok:false
+ *   2) no marker, basename matches a channel        → ok:true, name = basename
+ *   3) no marker, basename does NOT match           → ok:false (mentions basename + missing dir)
+ *   4) marker valid, channel dir exists             → ok:true, name = marker contents
+ *   5) marker valid, channel dir missing            → ok:false (names channel + tells user how to add)
+ *   6) marker present but empty/whitespace          → ok:false (mentions empty)
+ *   7) marker present but readFile returns undefined→ ok:false (mentions could not be read)
+ *   8) walk stops at homeDir                        → never consults markers above homeDir
+ *   9) marker found short-circuits the walk         → deeper marker wins
+ *  10) cwdUsed is reported on success
+ *  11) candidates list — first ok wins              → resolveChannelFromCandidates picks first match
+ *  12) candidates list — all failing                → reason annotates which cwds were tried
+ *  13) candidates list — empty / all undefined      → ok:false with sensible reason
  */
 
 import { describe, test, expect } from 'bun:test'
-import { resolveChannel, type ResolveDeps, type ChannelResolution } from '../src/resolve'
+import {
+  resolveChannel,
+  resolveChannelFromCandidates,
+  type ResolveDeps,
+  type ChannelResolution,
+} from '../src/resolve'
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
 type MockFs = {
-  // Map of path → "dir" | "file" — controls pathExists.
   entries: Map<string, 'dir' | 'file'>
-  // Map of path → content for files. If a path has an entry here it's a file.
   files: Map<string, string>
-  // Set of paths that exist as files but whose readFile returns undefined.
   unreadable: Set<string>
 }
 
 function makeFs(): MockFs {
-  return {
-    entries: new Map(),
-    files: new Map(),
-    unreadable: new Set(),
-  }
+  return { entries: new Map(), files: new Map(), unreadable: new Set() }
 }
 
 function addDir(fs: MockFs, p: string) {
@@ -60,8 +61,7 @@ type DepsOverrides = Partial<ResolveDeps> & { fs?: MockFs }
 function makeDeps(overrides: DepsOverrides = {}): ResolveDeps {
   const fs = overrides.fs ?? makeFs()
   return {
-    claudeCodePid: overrides.claudeCodePid ?? 4242,
-    readParentCwd: overrides.readParentCwd ?? (() => undefined),
+    cwd: overrides.cwd ?? '/Users/example/code/myproj',
     channelsRoot: overrides.channelsRoot ?? '/Users/example/.tg-relay/channels',
     homeDir: overrides.homeDir ?? '/Users/example',
     pathExists: overrides.pathExists ?? ((p: string) => fs.entries.has(p)),
@@ -79,46 +79,19 @@ function lc(r: ChannelResolution): string {
   return r.reason.toLowerCase()
 }
 
-// ── 1: missing claudeCodePid ─────────────────────────────────────────────
+// ── 1: empty cwd ─────────────────────────────────────────────────────────
 
-describe('resolveChannel — claudeCodePid handling', () => {
-  test('returns ok:false when claudeCodePid is undefined', () => {
-    const result = resolveChannel(makeDeps({ claudeCodePid: undefined }))
-
+describe('resolveChannel — invalid input', () => {
+  test('empty cwd returns ok:false', () => {
+    const result = resolveChannel(makeDeps({ cwd: '' }))
     expect(result.ok).toBe(false)
     if (!result.ok) {
-      const reason = result.reason.toLowerCase()
-      expect(reason).toContain('claude code')
-      expect(reason).toContain('pid')
+      expect(lc(result)).toContain('cwd')
     }
   })
 })
 
-// ── 2: readParentCwd returns undefined ───────────────────────────────────
-
-describe('resolveChannel — parent cwd lookup failure', () => {
-  test('returns ok:false when readParentCwd returns undefined', () => {
-    const pid = 99999
-    const result = resolveChannel(
-      makeDeps({
-        claudeCodePid: pid,
-        readParentCwd: () => undefined,
-      }),
-    )
-
-    expect(result.ok).toBe(false)
-    if (!result.ok) {
-      const reason = result.reason.toLowerCase()
-      // AC says reason mentions lsof or cwd, plus the pid.
-      const mentionsLookupFailure =
-        reason.includes('lsof') || reason.includes('cwd')
-      expect(mentionsLookupFailure).toBe(true)
-      expect(result.reason).toContain(String(pid))
-    }
-  })
-})
-
-// ── 3 & 4: no marker file anywhere ───────────────────────────────────────
+// ── 2 & 3: no marker, basename fallback ──────────────────────────────────
 
 describe('resolveChannel — no marker, fall back to basename', () => {
   test('basename matches a configured channel → ok:true with basename', () => {
@@ -126,23 +99,14 @@ describe('resolveChannel — no marker, fall back to basename', () => {
     const channelsRoot = '/Users/example/.tg-relay/channels'
     const cwd = '/Users/example/code/myproj'
     const fs = makeFs()
-    // Walk locations have NO .claude-channel files.
-    // Channel dir exists for "myproj" (channels are stored as "telegram-<name>").
     addDir(fs, `${channelsRoot}/telegram-myproj`)
 
-    const deps = makeDeps({
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
-      channelsRoot,
-      homeDir: home,
-      fs,
-    })
-
-    const result = resolveChannel(deps)
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs }))
 
     expect(result.ok).toBe(true)
     if (result.ok) {
       expect(result.name).toBe('myproj')
+      expect(result.cwdUsed).toBe(cwd)
     }
   })
 
@@ -150,33 +114,21 @@ describe('resolveChannel — no marker, fall back to basename', () => {
     const home = '/Users/example'
     const channelsRoot = '/Users/example/.tg-relay/channels'
     const cwd = '/Users/example/code/unknown-proj'
-    const fs = makeFs()
-    // No .claude-channel files anywhere; no channel dir exists.
 
-    const deps = makeDeps({
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
-      channelsRoot,
-      homeDir: home,
-      fs,
-    })
-
-    const result = resolveChannel(deps)
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs: makeFs() }))
 
     expect(result.ok).toBe(false)
     if (!result.ok) {
-      // The basename and the missing channel-dir path should both appear.
       expect(result.reason).toContain('unknown-proj')
-      // Channel dirs are stored under channelsRoot/telegram-<name>.
       expect(result.reason).toContain(`${channelsRoot}/telegram-unknown-proj`)
     }
   })
 })
 
-// ── 5: marker present, channel exists ────────────────────────────────────
+// ── 4-7: marker file present ─────────────────────────────────────────────
 
 describe('resolveChannel — marker file present', () => {
-  test('marker valid + channel dir exists → ok:true with marker content', () => {
+  test('marker valid + channel dir exists → ok:true with marker content + cwdUsed', () => {
     const home = '/Users/example'
     const channelsRoot = '/Users/example/.tg-relay/channels'
     const cwd = '/Users/example/code/myproj'
@@ -184,23 +136,14 @@ describe('resolveChannel — marker file present', () => {
     addFile(fs, `${cwd}/.claude-channel`, 'work\n')
     addDir(fs, `${channelsRoot}/telegram-work`)
 
-    const deps = makeDeps({
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
-      channelsRoot,
-      homeDir: home,
-      fs,
-    })
-
-    const result = resolveChannel(deps)
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs }))
 
     expect(result.ok).toBe(true)
     if (result.ok) {
       expect(result.name).toBe('work')
+      expect(result.cwdUsed).toBe(cwd)
     }
   })
-
-  // ── 6: marker present, channel does NOT exist ───────────────────────────
 
   test('marker valid + channel dir missing → ok:false naming channel and add command', () => {
     const home = '/Users/example'
@@ -208,24 +151,13 @@ describe('resolveChannel — marker file present', () => {
     const cwd = '/Users/example/code/myproj'
     const fs = makeFs()
     addFile(fs, `${cwd}/.claude-channel`, 'ghost-channel')
-    // channel dir does NOT exist.
 
-    const deps = makeDeps({
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
-      channelsRoot,
-      homeDir: home,
-      fs,
-    })
-
-    const result = resolveChannel(deps)
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs }))
 
     expect(result.ok).toBe(false)
     if (!result.ok) {
       expect(result.reason).toContain('ghost-channel')
-      const lower = result.reason.toLowerCase()
-      // Must hint at how to fix it — either "not configured" / "isn't configured"
-      // or mention claude-channel-add command.
+      const lower = lc(result)
       const hintsAtFix =
         lower.includes('not configured') ||
         lower.includes("isn't configured") ||
@@ -234,19 +166,12 @@ describe('resolveChannel — marker file present', () => {
     }
   })
 
-  // ── 7: marker file empty / whitespace ───────────────────────────────────
-
   test('marker file empty → ok:false mentioning empty', () => {
     const cwd = '/Users/example/code/myproj'
     const fs = makeFs()
     addFile(fs, `${cwd}/.claude-channel`, '')
 
-    const result = resolveChannel(
-      makeDeps({
-        readParentCwd: () => cwd,
-        fs,
-      }),
-    )
+    const result = resolveChannel(makeDeps({ cwd, fs }))
 
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -259,12 +184,7 @@ describe('resolveChannel — marker file present', () => {
     const fs = makeFs()
     addFile(fs, `${cwd}/.claude-channel`, '   \n\t  \n')
 
-    const result = resolveChannel(
-      makeDeps({
-        readParentCwd: () => cwd,
-        fs,
-      }),
-    )
+    const result = resolveChannel(makeDeps({ cwd, fs }))
 
     expect(result.ok).toBe(false)
     if (!result.ok) {
@@ -272,24 +192,16 @@ describe('resolveChannel — marker file present', () => {
     }
   })
 
-  // ── 8: marker file unreadable ───────────────────────────────────────────
-
   test('marker file present but readFile returns undefined → ok:false mentioning could not be read', () => {
     const cwd = '/Users/example/code/myproj'
     const fs = makeFs()
     addUnreadableFile(fs, `${cwd}/.claude-channel`)
 
-    const result = resolveChannel(
-      makeDeps({
-        readParentCwd: () => cwd,
-        fs,
-      }),
-    )
+    const result = resolveChannel(makeDeps({ cwd, fs }))
 
     expect(result.ok).toBe(false)
     if (!result.ok) {
       const lower = lc(result)
-      // "could not be read" — flexible: allow "could not be read" or "couldn't be read"
       const mentionsReadFailure =
         lower.includes('could not be read') ||
         lower.includes("couldn't be read") ||
@@ -300,88 +212,63 @@ describe('resolveChannel — marker file present', () => {
   })
 })
 
-// ── 9: walk stops at homeDir ─────────────────────────────────────────────
+// ── 8: walk boundaries ──────────────────────────────────────────────────
 
 describe('resolveChannel — walk boundaries', () => {
   test('does not ascend past homeDir; falls through to basename match', () => {
-    // parentCwd is OUTSIDE homeDir entirely. The walk must NOT consult
-    // a marker placed at "/" (or any ancestor above homeDir).
     const home = '/Users/example'
     const channelsRoot = '/Users/example/.tg-relay/channels'
     const cwd = '/tmp/work/sandbox'
     const fs = makeFs()
-    // Plant a marker at the filesystem root that, if consulted, would set
-    // the channel to something obviously wrong.
     addFile(fs, '/.claude-channel', 'rootchan')
     addDir(fs, `${channelsRoot}/telegram-rootchan`)
-    // Also configure a channel matching the basename so we can detect
-    // that resolution fell through to the basename path.
     addDir(fs, `${channelsRoot}/telegram-sandbox`)
 
-    // Track whether the resolver inspected the rooted marker.
     const consulted: string[] = []
-    const rawExists = (p: string) => fs.entries.has(p)
-    const rawRead = (p: string) =>
-      fs.unreadable.has(p) ? undefined : fs.files.get(p)
-
     const deps: ResolveDeps = {
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
+      cwd,
       channelsRoot,
       homeDir: home,
       pathExists: (p: string) => {
         consulted.push(p)
-        return rawExists(p)
+        return fs.entries.has(p)
       },
       readFile: (p: string) => {
         consulted.push(`READ:${p}`)
-        return rawRead(p)
+        return fs.unreadable.has(p) ? undefined : fs.files.get(p)
       },
     }
 
     const result = resolveChannel(deps)
 
-    // Must NOT have read /.claude-channel.
     expect(consulted.includes('READ:/.claude-channel')).toBe(false)
-    // Should fall through to basename → "sandbox" since that's configured.
-    // (If the resolver chose not to even consider basename for cwds outside
-    // homeDir, we'd see ok:false; the AC explicitly says it should fall
-    // through to basename, so we expect ok:true with name "sandbox".)
     expect(result.ok).toBe(true)
     if (result.ok) {
       expect(result.name).toBe('sandbox')
     }
   })
 
-  test('walk stops at homeDir — deeper marker still wins, but no ascent above home', () => {
+  test('walk stops at homeDir — falls through to basename without ascending past home', () => {
     const home = '/Users/example'
     const channelsRoot = '/Users/example/.tg-relay/channels'
     const cwd = '/Users/example/a/b/c'
     const fs = makeFs()
-    // Place a marker ABOVE homeDir at /Users/.claude-channel that, if read,
-    // would point to an existing channel "leaked".
     addFile(fs, '/Users/.claude-channel', 'leaked')
     addDir(fs, `${channelsRoot}/telegram-leaked`)
-    // No markers inside the homeDir walk — ensure we fall through to basename.
     addDir(fs, `${channelsRoot}/telegram-c`)
 
     const consulted: string[] = []
-    const rawExists = (p: string) => fs.entries.has(p)
-    const rawRead = (p: string) =>
-      fs.unreadable.has(p) ? undefined : fs.files.get(p)
-
     const deps: ResolveDeps = {
-      claudeCodePid: 4242,
-      readParentCwd: () => cwd,
+      cwd,
       channelsRoot,
       homeDir: home,
       pathExists: (p: string) => {
         consulted.push(p)
-        return rawExists(p)
+        return fs.entries.has(p)
       },
       readFile: (p: string) => {
         consulted.push(`READ:${p}`)
-        return rawRead(p)
+        return fs.unreadable.has(p) ? undefined : fs.files.get(p)
       },
     }
 
@@ -395,7 +282,7 @@ describe('resolveChannel — walk boundaries', () => {
   })
 })
 
-// ── 10: deeper marker short-circuits the walk ────────────────────────────
+// ── 9: deepest marker wins ──────────────────────────────────────────────
 
 describe('resolveChannel — deepest marker wins', () => {
   test('marker at depth 2 is used; ancestor marker at depth 1 is not consulted', () => {
@@ -404,29 +291,23 @@ describe('resolveChannel — deepest marker wins', () => {
     const depth1 = '/Users/example/code'
     const depth2 = '/Users/example/code/myproj'
     const fs = makeFs()
-
     addFile(fs, `${depth2}/.claude-channel`, 'X')
     addFile(fs, `${depth1}/.claude-channel`, 'Y')
     addDir(fs, `${channelsRoot}/telegram-X`)
     addDir(fs, `${channelsRoot}/telegram-Y`)
 
     const consulted: string[] = []
-    const rawExists = (p: string) => fs.entries.has(p)
-    const rawRead = (p: string) =>
-      fs.unreadable.has(p) ? undefined : fs.files.get(p)
-
     const deps: ResolveDeps = {
-      claudeCodePid: 4242,
-      readParentCwd: () => depth2,
+      cwd: depth2,
       channelsRoot,
       homeDir: home,
       pathExists: (p: string) => {
         consulted.push(p)
-        return rawExists(p)
+        return fs.entries.has(p)
       },
       readFile: (p: string) => {
         consulted.push(`READ:${p}`)
-        return rawRead(p)
+        return fs.unreadable.has(p) ? undefined : fs.files.get(p)
       },
     }
 
@@ -436,9 +317,150 @@ describe('resolveChannel — deepest marker wins', () => {
     if (result.ok) {
       expect(result.name).toBe('X')
     }
-    // Must have read the depth-2 marker.
     expect(consulted).toContain(`READ:${depth2}/.claude-channel`)
-    // Must NOT have read the depth-1 marker — the walk should short-circuit.
     expect(consulted).not.toContain(`READ:${depth1}/.claude-channel`)
+  })
+})
+
+// ── 11-13: resolveChannelFromCandidates (issue #43) ──────────────────────
+
+describe('resolveChannelFromCandidates — multi-cwd priority', () => {
+  test('returns first ok cwd; later candidates not consulted', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const fs = makeFs()
+    addDir(fs, `${channelsRoot}/telegram-myproj`)
+    addDir(fs, `${channelsRoot}/telegram-other`)
+
+    const cwd1 = '/Users/example/code/myproj'
+    const cwd2 = '/Users/example/code/other'
+
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot,
+        homeDir: home,
+        pathExists: (p: string) => fs.entries.has(p),
+        readFile: (p: string) => fs.files.get(p),
+      },
+      [cwd1, cwd2],
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.name).toBe('myproj')
+      expect(result.cwdUsed).toBe(cwd1)
+    }
+  })
+
+  test('skips empty/undefined candidates and tries the next', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const fs = makeFs()
+    addDir(fs, `${channelsRoot}/telegram-myproj`)
+
+    const cwd2 = '/Users/example/code/myproj'
+
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot,
+        homeDir: home,
+        pathExists: (p: string) => fs.entries.has(p),
+        readFile: (p: string) => fs.files.get(p),
+      },
+      [undefined, '', cwd2],
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.name).toBe('myproj')
+      expect(result.cwdUsed).toBe(cwd2)
+    }
+  })
+
+  test('falls through to second candidate when first fails', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const fs = makeFs()
+    // First cwd resolves nothing; second cwd has a marker.
+    addDir(fs, `${channelsRoot}/telegram-second`)
+
+    const cwd1 = '/Users/example/wrong-place'
+    const cwd2 = '/Users/example/code/second'
+
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot,
+        homeDir: home,
+        pathExists: (p: string) => fs.entries.has(p),
+        readFile: (p: string) => fs.files.get(p),
+      },
+      [cwd1, cwd2],
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.name).toBe('second')
+      expect(result.cwdUsed).toBe(cwd2)
+    }
+  })
+
+  test('all candidates fail → reason annotates the list of cwds tried', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const fs = makeFs()
+
+    const cwds = ['/Users/example/a', '/Users/example/b']
+
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot,
+        homeDir: home,
+        pathExists: (p: string) => fs.entries.has(p),
+        readFile: (p: string) => fs.files.get(p),
+      },
+      cwds,
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      // The reason must include both attempted cwds so the user can see
+      // what was tried.
+      expect(result.reason).toContain('/Users/example/a')
+      expect(result.reason).toContain('/Users/example/b')
+    }
+  })
+
+  test('empty candidates list → ok:false with sensible reason', () => {
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot: '/Users/example/.tg-relay/channels',
+        homeDir: '/Users/example',
+        pathExists: () => false,
+        readFile: () => undefined,
+      },
+      [],
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(lc(result)).toContain('cwd')
+    }
+  })
+
+  test('all candidates undefined → ok:false', () => {
+    const result = resolveChannelFromCandidates(
+      {
+        channelsRoot: '/Users/example/.tg-relay/channels',
+        homeDir: '/Users/example',
+        pathExists: () => false,
+        readFile: () => undefined,
+      },
+      [undefined, undefined, undefined],
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(lc(result)).toContain('cwd')
+    }
   })
 })

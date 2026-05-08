@@ -33,7 +33,7 @@ import type {
   OutboundReply, OutboundReact, OutboundEdit, OutboundDownload,
   ForwardPermissionRequest,
 } from './protocol.js'
-import { resolveChannel, type ChannelResolution } from './resolve.js'
+import { resolveChannelFromCandidates, type ChannelResolution } from './resolve.js'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -127,27 +127,46 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
 const claudeCodePid = findClaudeCodePid()
-const resolution: ChannelResolution = resolveChannel({
-  claudeCodePid,
-  readParentCwd: readParentCwdViaLsof,
-  channelsRoot: CHANNELS_ROOT,
-  homeDir: HOME,
-  pathExists: existsSync,
-  readFile: p => {
-    try { return readFileSync(p, 'utf8') } catch { return undefined }
+
+// Try the plugin's own cwd first (issue #43): Claude Code spawns the
+// plugin inheriting its own cwd, which is the project directory. This is
+// the most reliable signal because it doesn't depend on walking the
+// process tree, which can pick the wrong claude process when multiple
+// sessions run concurrently. Fall back to the lsof-of-grandparent path
+// as a robustness net for unusual process topologies.
+const candidateCwds: Array<string | undefined> = [
+  safeProcessCwd(),
+  process.env.PWD,
+  claudeCodePid ? readParentCwdViaLsof(claudeCodePid) : undefined,
+]
+const resolution: ChannelResolution = resolveChannelFromCandidates(
+  {
+    channelsRoot: CHANNELS_ROOT,
+    homeDir: HOME,
+    pathExists: existsSync,
+    readFile: (p: string) => {
+      try { return readFileSync(p, 'utf8') } catch { return undefined }
+    },
   },
-})
+  candidateCwds,
+)
+
 const channelName = resolution.ok ? resolution.name : undefined
 const resolutionReason = resolution.ok ? undefined : resolution.reason
+const resolutionCwd = resolution.ok ? resolution.cwdUsed : undefined
 const stateDir = channelName ? join(CHANNELS_ROOT, `telegram-${channelName}`) : null
 const socketPath = stateDir ? join(stateDir, 'session.sock') : null
 
 if (resolution.ok) {
   process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)
-  logToRouter(`resolved channel='${channelName}' parent=${claudeCodePid ?? 'unknown'}`)
+  logToRouter(`resolved channel='${channelName}' cwd='${resolutionCwd}' parent=${claudeCodePid ?? 'unknown'}`)
 } else {
   process.stderr.write(`tg-relay plugin: ${resolution.reason}. Running MCP server but skipping socket connection — Telegram tools will return this reason if called.\n`)
   logToRouter(`channel resolution failed: ${resolution.reason}`)
+}
+
+function safeProcessCwd(): string | undefined {
+  try { return process.cwd() } catch { return undefined }
 }
 
 const mcp = new Server(
@@ -587,30 +606,57 @@ function shutdown(reason: string = 'unknown'): void {
 // transport close. In practice (issue #26) those signals occasionally fail
 // to deliver — bun + closed-pipe edge cases leave the plugin alive after
 // its parent is gone, sometimes pegging CPU at 95%+. This watchdog is the
-// belt-and-suspenders fallback: poll the original Claude Code grandparent
-// PID every 10 seconds, and shut down if it's gone.
+// belt-and-suspenders fallback.
+//
+// We monitor TWO conditions on each tick (both must remain healthy):
+//
+//   (a) `process.ppid` — the *current* direct parent. When the immediate
+//       parent dies, the plugin is reparented to launchd and process.ppid
+//       drops to 1. Catches the common case where Claude Code is the
+//       direct parent and exits.
+//
+//   (b) `claudeCodePid` — the captured ancestor pid resolved by
+//       `findClaudeCodePid()` at startup. Catches the case where the
+//       direct parent is a wrapper that hangs around after the real
+//       Claude Code grandparent dies (T4 in lifecycle.test.ts).
+//
+// Either condition firing triggers shutdown. (a) catches issue #43's
+// failure mode where we walked one level too high; (b) preserves the
+// orphan-detection coverage from issue #26.
 
 const PARENT_CHECK_INTERVAL_MS = 10_000
 let parentWatchdogTimer: ReturnType<typeof setInterval> | null = null
+const startupPpid = process.ppid
 
 function startParentWatchdog(): void {
-  if (!claudeCodePid) {
-    process.stderr.write('tg-relay plugin: no parent PID resolved at startup; watchdog disabled\n')
+  if (startupPpid <= 1 && !claudeCodePid) {
+    process.stderr.write('tg-relay plugin: no parent to watch (ppid<=1, claudeCodePid unresolved); watchdog disabled\n')
     return
   }
   parentWatchdogTimer = setInterval(() => {
-    try {
-      // Signal 0 doesn't deliver a signal, just checks process existence
-      // (and that we have permission to signal it). Throws ESRCH if dead.
-      process.kill(claudeCodePid, 0)
-    } catch (err: unknown) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code === 'ESRCH') {
-        process.stderr.write(`tg-relay plugin: parent (Claude Code pid=${claudeCodePid}) is gone; shutting down\n`)
-        shutdown('parent-exit')
+    // (a) Direct-parent reparented or gone.
+    const currentPpid = process.ppid
+    if (currentPpid <= 1 || currentPpid !== startupPpid) {
+      process.stderr.write(
+        `tg-relay plugin: parent reparented (was pid=${startupPpid}, now pid=${currentPpid}); shutting down\n`,
+      )
+      shutdown('parent-exit')
+      return
+    }
+
+    // (b) Resolved Claude Code ancestor is gone.
+    if (claudeCodePid) {
+      try {
+        process.kill(claudeCodePid, 0)
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ESRCH') {
+          process.stderr.write(`tg-relay plugin: ancestor Claude Code (pid=${claudeCodePid}) is gone; shutting down\n`)
+          shutdown('parent-exit')
+          return
+        }
+        // EPERM: parent still exists, we just can't probe. No-op.
       }
-      // EPERM is unlikely between sibling processes; if it happens, treat as
-      // alive (parent still exists, we just can't probe). No-op.
     }
   }, PARENT_CHECK_INTERVAL_MS)
   parentWatchdogTimer.unref()

@@ -1,30 +1,37 @@
 /**
- * Channel resolution for the plugin (issue #24).
+ * Channel resolution for the plugin (issues #24, #43).
  *
- * Resolution can fail for half a dozen distinct reasons — couldn't read the
- * parent process cwd, marker file is empty, marker names a channel that
- * isn't configured, etc. Returning a structured result instead of just
- * `string | undefined` lets the plugin surface the actual failure to the
- * user instead of always blaming the .claude-channel marker.
+ * Walks up from a given cwd looking for a `.claude-channel` marker, falling
+ * back to a basename match against the channels root. Caller decides which
+ * cwd(s) to try and in what order; this function is pure given a single cwd.
  *
- * All filesystem and process lookups are injected via deps so this is
- * unit-testable without spawning processes or touching the real FS.
+ * The plugin (see plugin.ts) tries `process.cwd()` first — Claude Code spawns
+ * the plugin inheriting its own cwd, which is the project directory. This is
+ * the most reliable signal because it doesn't depend on walking the process
+ * tree, which can pick the wrong claude process when multiple sessions are
+ * running concurrently (issue #43). An lsof-based fallback walks the
+ * grandparent tree only if the cwd-based attempt didn't find a channel.
+ *
+ * Returning a structured result instead of just `string | undefined` lets
+ * the plugin surface the actual failure to the user instead of always
+ * blaming the `.claude-channel` marker (issue #24).
+ *
+ * All filesystem lookups are injected via deps so this is unit-testable
+ * without touching the real FS.
  */
 
 import { dirname } from 'path'
 
 export type ChannelResolution =
-  | { ok: true; name: string }
+  | { ok: true; name: string; cwdUsed: string }
   | { ok: false; reason: string }
 
 export type ResolveDeps = {
-  /** Claude Code's PID, or undefined if the parent walk failed. */
-  claudeCodePid: number | undefined
-  /** Reads the cwd of the given pid (e.g. via `lsof -d cwd`). Undefined on failure. */
-  readParentCwd: (pid: number) => string | undefined
+  /** The cwd to walk for marker / basename match. */
+  cwd: string
   /** Base channel dir, e.g. `~/.claude/channels`. */
   channelsRoot: string
-  /** Home directory — the upward .claude-channel walk stops here. */
+  /** Home directory — the upward `.claude-channel` walk stops here. */
   homeDir: string
   /** True if the path exists. */
   pathExists: (p: string) => boolean
@@ -33,22 +40,12 @@ export type ResolveDeps = {
 }
 
 export function resolveChannel(deps: ResolveDeps): ChannelResolution {
-  if (!deps.claudeCodePid) {
-    return {
-      ok: false,
-      reason: 'could not determine the Claude Code parent pid (ps lookup of process.ppid failed)',
-    }
+  const cwd = deps.cwd
+  if (!cwd) {
+    return { ok: false, reason: 'no cwd to resolve from (empty input)' }
   }
 
-  const parentCwd = deps.readParentCwd(deps.claudeCodePid)
-  if (!parentCwd) {
-    return {
-      ok: false,
-      reason: `could not read cwd of Claude Code pid=${deps.claudeCodePid} (lsof returned no parsable line)`,
-    }
-  }
-
-  let dir = parentCwd
+  let dir = cwd
   while (dir && dir.startsWith(deps.homeDir) && dir !== deps.homeDir) {
     const channelFile = `${dir}/.claude-channel`
     if (deps.pathExists(channelFile)) {
@@ -73,27 +70,55 @@ export function resolveChannel(deps: ResolveDeps): ChannelResolution {
           reason: `${channelFile} names channel '${name}' but ${channelDir} does not exist (channel is not configured — run claude-channel-add ${name} <token>)`,
         }
       }
-      return { ok: true, name }
+      return { ok: true, name, cwdUsed: cwd }
     }
     const parent = dirname(dir)
     if (parent === dir) break
     dir = parent
   }
 
-  const base = parentCwd.split('/').filter(Boolean).pop()
+  const base = cwd.split('/').filter(Boolean).pop()
   if (base) {
     const channelDir = `${deps.channelsRoot}/telegram-${base}`
     if (deps.pathExists(channelDir)) {
-      return { ok: true, name: base }
+      return { ok: true, name: base, cwdUsed: cwd }
     }
     return {
       ok: false,
-      reason: `no .claude-channel file in any parent of '${parentCwd}', and basename '${base}' is not a configured channel (no ${channelDir})`,
+      reason: `no .claude-channel file in any parent of '${cwd}', and basename '${base}' is not a configured channel (no ${channelDir})`,
     }
   }
 
   return {
     ok: false,
-    reason: `no .claude-channel file in any parent of '${parentCwd}' and could not derive a basename to match`,
+    reason: `no .claude-channel file in any parent of '${cwd}' and could not derive a basename to match`,
+  }
+}
+
+/**
+ * Try multiple candidate cwds in order, returning the first success.
+ * On total failure, returns the last attempt's reason annotated with the
+ * full list of cwds tried — so the user sees both *what* we tried and
+ * *why none worked*.
+ */
+export function resolveChannelFromCandidates(
+  deps: Omit<ResolveDeps, 'cwd'>,
+  candidateCwds: ReadonlyArray<string | undefined>,
+): ChannelResolution {
+  const tried: string[] = []
+  let lastReason = 'no cwds available to try'
+  for (const cwd of candidateCwds) {
+    if (!cwd) continue
+    tried.push(cwd)
+    const r = resolveChannel({ ...deps, cwd })
+    if (r.ok) return r
+    lastReason = r.reason
+  }
+  if (tried.length === 0) {
+    return { ok: false, reason: 'no cwds available to try (all candidates were empty)' }
+  }
+  return {
+    ok: false,
+    reason: `${lastReason} (tried cwds in order: ${tried.join(' → ')})`,
   }
 }
