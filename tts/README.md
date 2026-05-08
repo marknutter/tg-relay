@@ -23,8 +23,19 @@ The installer:
 1. Creates `tts/.venv` with Python 3.11
 2. Installs pinned dependencies via `uv pip install -r requirements.txt`
 3. Writes and loads `~/Library/LaunchAgents/com.marknutter.tg-relay-tts.plist`
+4. Writes and loads `~/Library/LaunchAgents/com.marknutter.tg-relay-tts-bouncer.plist` — a small calendar-triggered helper that kicks the sidecar at 04:00 daily (issue #20)
 
 The sidecar starts automatically on boot and restarts on crash. Model download happens lazily on the first synthesis request.
+
+### Why a nightly bouncer?
+
+F5-TTS + PyTorch + MPS degrades over multi-day uptime — short replies that should synthesize in seconds start taking minutes, hit `TG_RELAY_TTS_TIMEOUT_MS`, and the daemon falls back to text. Bouncing the sidecar reliably resets the runaway state, so the bouncer plist `launchctl kickstart -k`'s the sidecar at 04:00 local time. ~30s outage during model reload, paid once a day in a low-traffic window.
+
+To bounce manually (e.g. when you notice slowness mid-day):
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.marknutter.tg-relay-tts"
+```
 
 ## Reference audio (required)
 

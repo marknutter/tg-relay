@@ -14,6 +14,8 @@ SERVER_PY="$TTS_DIR/server.py"
 
 PLIST_NAME="com.marknutter.tg-relay-tts"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+BOUNCER_PLIST_NAME="com.marknutter.tg-relay-tts-bouncer"
+BOUNCER_PLIST_DST="$HOME/Library/LaunchAgents/$BOUNCER_PLIST_NAME.plist"
 LOG_FILE="$HOME/.claude/channels/tg-relay-tts.log"
 
 if ! command -v uv &>/dev/null; then
@@ -81,6 +83,60 @@ EOF
 
 launchctl load "$PLIST_DST"
 echo "   Loaded: $PLIST_DST"
+
+# 5. Install nightly bouncer plist (issue #20)
+#
+# F5-TTS + PyTorch + MPS degrades over multi-day uptime — short replies
+# start synthesizing in minutes instead of seconds, hit the daemon's
+# TTS_TIMEOUT_MS, and fall back to text. Bouncing the sidecar reliably
+# resets the runaway state. Schedule a daily restart at 4 AM (low-traffic
+# window) so the user doesn't have to remember to do it manually.
+#
+# launchctl kickstart -k waits for graceful exit before restarting; with
+# KeepAlive=true on the main sidecar plist, the sidecar respawns
+# immediately. ~30s outage during model reload, paid once a day.
+echo ""
+echo "4. Installing nightly bouncer..."
+
+if launchctl list "$BOUNCER_PLIST_NAME" &>/dev/null; then
+  echo "   Unloading existing bouncer..."
+  launchctl unload "$BOUNCER_PLIST_DST" 2>/dev/null || true
+fi
+
+cat > "$BOUNCER_PLIST_DST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$BOUNCER_PLIST_NAME</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>/bin/launchctl kickstart -k "gui/\$(id -u)/$PLIST_NAME"</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>$LOG_FILE</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+
+launchctl load "$BOUNCER_PLIST_DST"
+echo "   Loaded: $BOUNCER_PLIST_DST"
+echo "   Sidecar will be bounced daily at 04:00 local time."
 
 echo ""
 echo "Done!"
