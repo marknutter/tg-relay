@@ -84,9 +84,17 @@ The daemon picks up new channels automatically — no restart needed.
 
 ### Channel resolution order
 
-1. Walk up from project root looking for a `.claude-channel` file
-2. Match directory basename against `~/.claude/channels/telegram-{name}/`
-3. If neither matches, the plugin runs but stays unconfigured — Telegram tools return an error explaining the specific failure (no marker file found, marker present but channel dir missing, lsof failed to read the parent cwd, etc.) and no socket connection is made. The reason is also written to `telegram-router.log` so the daemon-side log captures *why* a session failed to bind.
+The plugin tries multiple cwds in priority order, stopping at the first one that resolves a channel:
+
+1. **Plugin's own `process.cwd()`** — Claude Code spawns the plugin inheriting its own cwd, which is the project directory. This is the most reliable signal because it doesn't depend on walking the process tree (issue #43).
+2. **`process.env.PWD`** — fallback in case `process.cwd()` is somehow wrong.
+3. **`lsof` of the resolved Claude Code parent's cwd** — last-resort fallback for unusual process topologies.
+
+For each candidate cwd, the plugin:
+1. Walks up from the cwd looking for a `.claude-channel` file (stops at `$HOME`)
+2. Falls back to matching the cwd's basename against `~/.claude/channels/telegram-{name}/`
+
+If none of the candidates resolves a channel, the plugin runs but stays unconfigured — Telegram tools return an error explaining the specific failure for each cwd that was tried. The reason is also written to `telegram-router.log` so the daemon-side log captures *why* a session failed to bind.
 
 ### Multiple sessions per channel
 
