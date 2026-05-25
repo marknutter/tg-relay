@@ -78,10 +78,15 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 
-// Under launchd the plist routes stderr directly to telegram-router.log via
-// StandardErrorPath, so we'd double-write if we appendFileSync'd ourselves.
-// XPC_SERVICE_NAME is set by launchd and not by interactive shells / tests,
-// so we can use it to detect that environment.
+// Under launchd (macOS) the plist routes stderr directly to telegram-router.log
+// via StandardErrorPath, so we'd double-write if we appendFileSync'd ourselves.
+// XPC_SERVICE_NAME is set by launchd and not by interactive shells / tests, so
+// we use it to detect that environment.
+//
+// On Windows under Task Scheduler there is no StandardErrorPath equivalent:
+// XPC_SERVICE_NAME is absent, so this is false and the daemon writes to
+// LOG_FILE itself via appendFileSync below. That is the intended behavior — the
+// scheduled task runs `bun daemon.ts` with no output redirection.
 const STDERR_GOES_TO_LOG_FILE = !!process.env.XPC_SERVICE_NAME
 
 function log(channel: string, msg: string): void {
