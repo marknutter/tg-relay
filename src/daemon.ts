@@ -25,7 +25,7 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
-import { cleanupStaleIpc, restrictIpcAddress } from './ipc.js'
+import { cleanupStaleIpc, restrictIpcAddress, isWindows } from './ipc.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
@@ -1302,6 +1302,13 @@ function connectedPluginPids(): Set<number> {
  */
 function findRunningPlugins(): Map<number, number> {
   const pids = new Map<number, number>()
+  // The orphan reaper relies on the `ps` process table and unix ppid-reparenting
+  // semantics, neither of which exist on Windows. It is a backstop only —
+  // connected plugins are tracked via state.socketPids and cleaned up on socket
+  // 'close', so skipping it on Windows degrades gracefully (a plugin that
+  // crashes without a clean disconnect simply won't be force-killed by the
+  // daemon). A Windows-native reaper (tasklist/WMI) is a possible follow-up.
+  if (isWindows) return pids
   let raw: string
   try {
     raw = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {
