@@ -21,11 +21,11 @@ import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, existsSync, appendFileSync,
-  chmodSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
+import { cleanupStaleIpc, restrictIpcAddress } from './ipc.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
@@ -963,10 +963,10 @@ async function startChannel(config: ChannelConfig): Promise<void> {
 
   const bot = new Bot(config.botToken)
 
-  // Clean up stale socket file
-  try { unlinkSync(config.socketPath) } catch {}
+  // Clean up stale socket file (unix only; named pipes self-release on Windows)
+  cleanupStaleIpc(config.socketPath)
 
-  // Create the unix socket server. Multiple plugin connections per channel
+  // Create the local IPC server. Multiple plugin connections per channel
   // are supported — see ChannelState.sockets for the rationale.
   const server = net.createServer(socket => {
     state.sockets.add(socket)
@@ -1004,7 +1004,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   })
 
   server.listen(config.socketPath, () => {
-    try { chmodSync(config.socketPath, 0o700) } catch {}
+    restrictIpcAddress(config.socketPath)
     log(config.name, `socket listening at ${config.socketPath}`)
   })
 
@@ -1134,7 +1134,7 @@ async function stopChannel(name: string): Promise<void> {
   state.socketProjects.clear()
 
   state.server.close()
-  try { unlinkSync(state.config.socketPath) } catch {}
+  cleanupStaleIpc(state.config.socketPath)
 
   log(name, `aborting in-flight getUpdates connection (cleanup)`)
   const outcome = await stopBotWithTimeout(state.bot, CHANNEL_STOP_TIMEOUT_MS)

@@ -8,12 +8,13 @@
 import { readdirSync, readFileSync, existsSync } from 'fs'
 import { join, basename, resolve } from 'path'
 import { homedir } from 'os'
+import { ipcAddress } from './ipc.js'
 
 export type ChannelConfig = {
   name: string           // e.g. "eve", "mtl", "main"
   stateDir: string       // full path to ~/.claude/channels/telegram-{name}
   botToken: string       // from .env
-  socketPath: string     // unix socket path for IPC
+  socketPath: string     // IPC endpoint: unix socket path (Unix) or named pipe (Windows)
 }
 
 const CHANNELS_ROOT = process.env.TG_RELAY_CHANNELS_ROOT ?? join(homedir(), '.claude', 'channels')
@@ -56,7 +57,7 @@ export function discoverChannels(): ChannelConfig[] {
       name,
       stateDir,
       botToken,
-      socketPath: join(stateDir, 'session.sock'),
+      socketPath: ipcAddress(name, stateDir),
     })
   }
 
@@ -89,8 +90,8 @@ export function resolveChannelName(claudeCodeCwd: string): string | undefined {
     dir = resolved
   }
 
-  // Basename match
-  const base = claudeCodeCwd.split('/').pop()
+  // Basename match (use path.basename so it handles both / and \ separators)
+  const base = basename(claudeCodeCwd)
   if (base && existsSync(join(CHANNELS_ROOT, `telegram-${base}`))) {
     return base
   }
