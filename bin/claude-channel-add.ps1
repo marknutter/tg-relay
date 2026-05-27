@@ -29,6 +29,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Write UTF-8 WITHOUT a BOM. Windows PowerShell 5.1's `Set-Content -Encoding
+# UTF8` prepends a BOM (U+FEFF), which breaks the daemon's `.env` token parse
+# and JSON.parse of access.json. Always route file writes through this.
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding $false))
+}
+
 # Channel name: lowercase alphanumeric + hyphens only (keeps pipe names simple)
 if ($Name -cnotmatch '^[a-z0-9-]+$') {
   Write-Error "Channel name must be lowercase alphanumeric with hyphens."
@@ -67,7 +74,7 @@ if (Test-Path $stateDir) {
 New-Item -ItemType Directory -Path (Join-Path $stateDir 'approved') -Force | Out-Null
 
 # Write .env (profile dir is already user-private; no chmod equivalent needed)
-Set-Content -Path (Join-Path $stateDir '.env') -Value "TELEGRAM_BOT_TOKEN=$Token" -Encoding UTF8 -NoNewline
+Write-Utf8NoBom (Join-Path $stateDir '.env') "TELEGRAM_BOT_TOKEN=$Token`n"
 
 if ($Owner) {
   $access = [ordered]@{
@@ -76,9 +83,9 @@ if ($Owner) {
     groups    = @{}
     pending   = @{}
   }
-  $access | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $stateDir 'access.json') -Encoding UTF8
+  Write-Utf8NoBom (Join-Path $stateDir 'access.json') ($access | ConvertTo-Json -Depth 10)
   # Pre-seed the approval marker so the daemon skips the pairing confirmation.
-  Set-Content -Path (Join-Path $stateDir "approved\$Owner") -Value $Owner -Encoding UTF8
+  Write-Utf8NoBom (Join-Path $stateDir "approved\$Owner") $Owner
   Write-Host "Owner $Owner pre-allowlisted. Bot is ready to receive messages from you."
 } else {
   $access = [ordered]@{
@@ -87,7 +94,7 @@ if ($Owner) {
     groups    = @{}
     pending   = @{}
   }
-  $access | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $stateDir 'access.json') -Encoding UTF8
+  Write-Utf8NoBom (Join-Path $stateDir 'access.json') ($access | ConvertTo-Json -Depth 10)
   Write-Host "No owner ID provided - channel opens in pairing mode."
   Write-Host "Next: DM the bot, get a 6-char code, run '/telegram:access pair <code>' in a session."
 }

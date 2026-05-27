@@ -20,6 +20,13 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# Write UTF-8 WITHOUT a BOM. Windows PowerShell 5.1's `Set-Content -Encoding
+# UTF8` prepends a BOM (U+FEFF). A BOM in settings.json or .mcp.json breaks the
+# JSON parsers that read them (Node's JSON.parse throws on a leading BOM).
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding $false))
+}
+
 $ScriptDir   = $PSScriptRoot
 $TaskName    = 'tg-relay daemon'
 $DaemonEntry = Join-Path $ScriptDir 'src\daemon.ts'
@@ -105,7 +112,7 @@ if (Test-Path $CachedPlugin) {
     $mcpJson = Join-Path $versionDir.FullName '.mcp.json'
     if (Test-Path $mcpJson) {
       if (-not (Test-Path "$mcpJson.bak")) { Copy-Item $mcpJson "$mcpJson.bak" }
-      Set-Content -Path $mcpJson -Value $mcpContent -Encoding UTF8
+      Write-Utf8NoBom $mcpJson $mcpContent
       Write-Host "   Redirected $mcpJson -> $PluginEntry"
       $hijacked++
     }
@@ -142,7 +149,7 @@ if (Test-Path $settingsFile) {
       $data | Add-Member -NotePropertyName 'enabledPlugins' -NotePropertyValue ([pscustomobject]@{}) -Force
     }
     $data.enabledPlugins | Add-Member -NotePropertyName 'telegram@claude-plugins-official' -NotePropertyValue $true -Force
-    $data | ConvertTo-Json -Depth 20 | Set-Content -Path $settingsFile -Encoding UTF8
+    Write-Utf8NoBom $settingsFile ($data | ConvertTo-Json -Depth 20)
     Write-Host "   Enabled telegram plugin in settings (runs tg-relay code)."
   } catch {
     Write-Host "   Warning: could not patch settings.json: $_"

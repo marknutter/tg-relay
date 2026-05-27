@@ -39,7 +39,11 @@ export function discoverChannels(): ChannelConfig[] {
 
     let botToken: string | undefined
     try {
-      const contents = readFileSync(envFile, 'utf8')
+      // Strip a leading UTF-8 BOM. Windows editors and PowerShell's
+      // `Set-Content -Encoding UTF8` (5.1) prepend one (U+FEFF), which would
+      // otherwise break the `^TELEGRAM_BOT_TOKEN=` match on the first line.
+      const raw = readFileSync(envFile, 'utf8')
+      const contents = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw
       for (const line of contents.split('\n')) {
         const m = line.match(/^TELEGRAM_BOT_TOKEN=(.+)$/)
         if (m) { botToken = m[1].trim(); break }
