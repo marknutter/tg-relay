@@ -6,3 +6,6 @@ tts/.venv/
 tts/__pycache__/
 **/*.pyc
 .claude/settings.local.json
+# Per-machine dev MCP config — the plugin runs via the hijacked built-in
+# plugin (see install.sh / install.ps1), not a committed project .mcp.json.
+.mcp.json
