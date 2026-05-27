@@ -21,11 +21,11 @@ import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, existsSync, appendFileSync,
-  chmodSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep, extname } from 'path'
 import { discoverChannels, type ChannelConfig } from './channels.js'
+import { cleanupStaleIpc, restrictIpcAddress, isWindows } from './ipc.js'
 import { transcribeAudio } from './transcribe.js'
 import { synthesizeVoice } from './synthesize.js'
 import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type HeartbeatSchedule } from './heartbeats.js'
@@ -78,10 +78,15 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 
-// Under launchd the plist routes stderr directly to telegram-router.log via
-// StandardErrorPath, so we'd double-write if we appendFileSync'd ourselves.
-// XPC_SERVICE_NAME is set by launchd and not by interactive shells / tests,
-// so we can use it to detect that environment.
+// Under launchd (macOS) the plist routes stderr directly to telegram-router.log
+// via StandardErrorPath, so we'd double-write if we appendFileSync'd ourselves.
+// XPC_SERVICE_NAME is set by launchd and not by interactive shells / tests, so
+// we use it to detect that environment.
+//
+// On Windows under Task Scheduler there is no StandardErrorPath equivalent:
+// XPC_SERVICE_NAME is absent, so this is false and the daemon writes to
+// LOG_FILE itself via appendFileSync below. That is the intended behavior — the
+// scheduled task runs `bun daemon.ts` with no output redirection.
 const STDERR_GOES_TO_LOG_FILE = !!process.env.XPC_SERVICE_NAME
 
 function log(channel: string, msg: string): void {
@@ -963,10 +968,10 @@ async function startChannel(config: ChannelConfig): Promise<void> {
 
   const bot = new Bot(config.botToken)
 
-  // Clean up stale socket file
-  try { unlinkSync(config.socketPath) } catch {}
+  // Clean up stale socket file (unix only; named pipes self-release on Windows)
+  cleanupStaleIpc(config.socketPath)
 
-  // Create the unix socket server. Multiple plugin connections per channel
+  // Create the local IPC server. Multiple plugin connections per channel
   // are supported — see ChannelState.sockets for the rationale.
   const server = net.createServer(socket => {
     state.sockets.add(socket)
@@ -1004,7 +1009,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   })
 
   server.listen(config.socketPath, () => {
-    try { chmodSync(config.socketPath, 0o700) } catch {}
+    restrictIpcAddress(config.socketPath)
     log(config.name, `socket listening at ${config.socketPath}`)
   })
 
@@ -1134,7 +1139,7 @@ async function stopChannel(name: string): Promise<void> {
   state.socketProjects.clear()
 
   state.server.close()
-  try { unlinkSync(state.config.socketPath) } catch {}
+  cleanupStaleIpc(state.config.socketPath)
 
   log(name, `aborting in-flight getUpdates connection (cleanup)`)
   const outcome = await stopBotWithTimeout(state.bot, CHANNEL_STOP_TIMEOUT_MS)
@@ -1297,6 +1302,13 @@ function connectedPluginPids(): Set<number> {
  */
 function findRunningPlugins(): Map<number, number> {
   const pids = new Map<number, number>()
+  // The orphan reaper relies on the `ps` process table and unix ppid-reparenting
+  // semantics, neither of which exist on Windows. It is a backstop only —
+  // connected plugins are tracked via state.socketPids and cleaned up on socket
+  // 'close', so skipping it on Windows degrades gracefully (a plugin that
+  // crashes without a clean disconnect simply won't be force-killed by the
+  // daemon). A Windows-native reaper (tasklist/WMI) is a possible follow-up.
+  if (isWindows) return pids
   let raw: string
   try {
     raw = execFileSync('ps', ['-axo', 'pid=,ppid=,command='], {

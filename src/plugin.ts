@@ -34,6 +34,7 @@ import type {
   ForwardPermissionRequest,
 } from './protocol.js'
 import { resolveChannelFromCandidates, type ChannelResolution } from './resolve.js'
+import { ipcAddress } from './ipc.js'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -155,7 +156,7 @@ const channelName = resolution.ok ? resolution.name : undefined
 const resolutionReason = resolution.ok ? undefined : resolution.reason
 const resolutionCwd = resolution.ok ? resolution.cwdUsed : undefined
 const stateDir = channelName ? join(CHANNELS_ROOT, `telegram-${channelName}`) : null
-const socketPath = stateDir ? join(stateDir, 'session.sock') : null
+const socketPath = (channelName && stateDir) ? ipcAddress(channelName, stateDir) : null
 
 if (resolution.ok) {
   process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)

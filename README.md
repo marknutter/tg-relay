@@ -23,9 +23,11 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) (runtime for both daemon and plugin)
-- macOS (for launchd; systemd adaptation is straightforward)
-- A configured channel at `~/.claude/channels/telegram-<name>/` (install.sh drops a `claude-channel-add` helper into `~/bin/` — see Usage below)
+- [Bun](https://bun.sh) (runtime for both daemon and plugin). On Windows: `winget install Oven-sh.Bun`.
+- A process supervisor for the daemon, set up automatically by the installer:
+  - **macOS**: launchd (systemd adaptation is straightforward)
+  - **Windows**: a user-level Scheduled Task (the LaunchAgent analogue — runs in your session, restarts on crash)
+- A configured channel at `~/.claude/channels/telegram-<name>/`. The installer drops a `claude-channel-add` helper into `~/bin/` (macOS) or `claude-channel-add.ps1` (Windows) — see Usage below.
 - **Optional** (for voice note transcription): `whisper-cpp` and `ffmpeg`
   ```bash
   brew install whisper-cpp ffmpeg
@@ -37,6 +39,8 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
 - **Optional** (for voice-reply from Claude via a cloned voice): a separate Python sidecar at [`tts/`](tts/README.md). See that directory's README for setup. The core daemon works without it — voice replies gracefully fall back to text.
 
 ## Setup
+
+### macOS
 
 ```bash
 cd ~/Code/tg-relay
@@ -53,6 +57,40 @@ Then add this alias to your `~/.zshrc`:
 
 ```bash
 alias claude!="claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official"
+```
+
+### Windows
+
+Run from a **non-elevated** PowerShell (the daemon must run as you, in your user
+session, so it can read `~/.claude/channels/`):
+
+```powershell
+cd $env:USERPROFILE\Code\tg-relay
+bun install
+.\install.ps1
+```
+
+`install.ps1` mirrors the macOS installer:
+1. Registers the daemon as a user-level **Scheduled Task** ("tg-relay daemon" — runs at logon, restarts on crash) and starts it
+2. Redirects the built-in telegram plugin to run tg-relay's `plugin.ts`
+3. Enables the plugin in Claude Code settings (patched natively, no `python3`)
+4. Installs the `claude-channel-add.ps1` helper into `~\bin`
+
+Then add this function to your PowerShell profile (`$PROFILE`):
+
+```powershell
+function claude! { claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official @args }
+```
+
+Daemon/plugin IPC uses a unix domain socket on macOS and a **named pipe**
+(`\\.\pipe\tg-relay-<channel>`) on Windows — handled transparently by the
+runtime. Manage the daemon task with:
+
+```powershell
+Get-ScheduledTask 'tg-relay daemon' | Get-ScheduledTaskInfo   # status
+Stop-ScheduledTask 'tg-relay daemon'                          # stop
+Start-ScheduledTask 'tg-relay daemon'                         # start
+Get-Content $env:USERPROFILE\.claude\channels\telegram-router.log -Tail 40 -Wait  # logs
 ```
 
 The `--channels` flag is required — without it, Claude Code silently drops channel notifications.

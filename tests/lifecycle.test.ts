@@ -12,10 +12,18 @@
  * via `bun src/plugin.ts` / `bun src/daemon.ts` and observed externally.
  */
 
-import { test, expect, afterEach } from 'bun:test'
+import { test as baseTest, expect, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+
+// Every test in this file exercises Unix-only mechanisms: SIGTERM/SIGINT signal
+// semantics, the `ps`-based orphan reaper, `mkdir -p`, and process-tree
+// reparenting. None of these apply on Windows (the reaper is a deliberate no-op
+// there — see src/daemon.ts), so gate the whole file to non-Windows. The tests
+// continue to run unchanged on macOS/Linux. Windows-native lifecycle tests
+// (Task Scheduler stop, named-pipe teardown) are a possible follow-up.
+const test = baseTest.if(process.platform !== 'win32')
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
