@@ -20,7 +20,7 @@
  * without touching the real FS.
  */
 
-import { dirname } from 'path'
+import { dirname, basename } from 'path'
 
 export type ChannelResolution =
   | { ok: true; name: string; cwdUsed: string }
@@ -77,7 +77,9 @@ export function resolveChannel(deps: ResolveDeps): ChannelResolution {
     dir = parent
   }
 
-  const base = cwd.split('/').filter(Boolean).pop()
+  // Use path.basename so this works with both POSIX (`/`) and Windows (`\`)
+  // separators — `cwd.split('/')` returned the whole path on Windows.
+  const base = basename(cwd)
   if (base) {
     const channelDir = `${deps.channelsRoot}/telegram-${base}`
     if (deps.pathExists(channelDir)) {
