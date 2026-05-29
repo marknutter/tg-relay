@@ -27,10 +27,11 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
   [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding $false))
 }
 
-$ScriptDir   = $PSScriptRoot
-$TaskName    = 'tg-relay daemon'
-$DaemonEntry = Join-Path $ScriptDir 'src\daemon.ts'
-$PluginEntry = Join-Path $ScriptDir 'src\plugin.ts'
+$ScriptDir      = $PSScriptRoot
+$TaskName       = 'tg-relay daemon'
+$DaemonEntry    = Join-Path $ScriptDir 'src\daemon.ts'
+$PluginEntry    = Join-Path $ScriptDir 'src\plugin.ts'
+$HiddenLauncher = Join-Path $ScriptDir 'bin\start-daemon-hidden.vbs'
 $ClaudeHome  = Join-Path $env:USERPROFILE '.claude'
 $CachedPlugin = Join-Path $ClaudeHome 'plugins\cache\claude-plugins-official\telegram'
 $ChannelsRoot = if ($env:TG_RELAY_CHANNELS_ROOT) { $env:TG_RELAY_CHANNELS_ROOT } else { Join-Path $ClaudeHome 'channels' }
@@ -70,7 +71,16 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-$action = New-ScheduledTaskAction -Execute $Bun -Argument "`"$DaemonEntry`"" -WorkingDirectory $ScriptDir
+# Launch the daemon via a VBScript wrapper so no console window appears.
+# bun.exe is a console app; if Task Scheduler ran it directly in the
+# interactive user session, a foregrounded terminal would pop up on every
+# logon. wscript.exe is windowless by default and the VBS spawns bun with
+# window style SW_HIDE -- daemon runs identically, just invisibly.
+if (-not (Test-Path $HiddenLauncher)) {
+  Write-Error "Hidden launcher missing: $HiddenLauncher (should be tracked in the repo)"
+  exit 1
+}
+$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$HiddenLauncher`"" -WorkingDirectory $ScriptDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # Mirror launchd KeepAlive + ThrottleInterval(5s): restart on crash, run
 # indefinitely, start when available after a missed logon.
