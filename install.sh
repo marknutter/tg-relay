@@ -159,9 +159,45 @@ with open('$SETTINGS', 'w') as f:
 " 2>/dev/null && echo "   Enabled telegram plugin in settings (runs tg-relay code)."
 fi
 
-# 4. Install claude-channel-add helper into ~/bin
+# 4. Install the AskUserQuestion-suppression hook
+# The AskUserQuestion picker reads only the local TTY and can't be answered
+# from a relayed session, so it hangs. We install a PreToolUse hook that denies
+# it and redirects Claude to ask in plain numbered text instead.
 echo ""
-echo "4. Installing claude-channel-add helper..."
+echo "4. Installing AskUserQuestion-suppression hook..."
+
+HOOKS_DIR="$HOME/.claude/hooks"
+HOOK_SRC="$SCRIPT_DIR/hooks/block-askuserquestion.sh"
+HOOK_DST="$HOOKS_DIR/block-askuserquestion.sh"
+
+if [ -f "$HOOK_SRC" ]; then
+  mkdir -p "$HOOKS_DIR"
+  if [ -f "$HOOK_DST" ] && ! cmp -s "$HOOK_SRC" "$HOOK_DST"; then
+    [ -f "$HOOK_DST.bak" ] || cp "$HOOK_DST" "$HOOK_DST.bak"
+  fi
+  cp "$HOOK_SRC" "$HOOK_DST"
+  chmod +x "$HOOK_DST"
+  echo "   Installed: $HOOK_DST"
+
+  # Idempotently add an AskUserQuestion matcher to settings.json's
+  # hooks.PreToolUse array without disturbing existing matchers/hooks. The
+  # merge logic lives in a standalone, unit-tested script so install.sh and the
+  # tests exercise the exact same code path.
+  if [ -f "$SETTINGS" ]; then
+    if python3 "$SCRIPT_DIR/hooks/register-askuserquestion-hook.py" "$SETTINGS"; then
+      echo "   Registered PreToolUse matcher for AskUserQuestion."
+    else
+      echo "   Warning: could not update $SETTINGS (see message above)."
+    fi
+  else
+    echo "   Warning: $SETTINGS not found; skipped hook registration."
+    echo "   The hook script is installed but won't fire until settings.json exists."
+  fi
+fi
+
+# 5. Install claude-channel-add helper into ~/bin
+echo ""
+echo "5. Installing claude-channel-add helper..."
 
 BIN_DIR="$HOME/bin"
 BIN_SRC="$SCRIPT_DIR/bin/claude-channel-add"
@@ -187,9 +223,9 @@ if [ -f "$BIN_SRC" ]; then
   esac
 fi
 
-# 5. Set up shell alias
+# 6. Set up shell alias
 echo ""
-echo "5. Shell alias"
+echo "6. Shell alias"
 echo ""
 echo "   Add this to your ~/.zshrc (or equivalent):"
 echo ""

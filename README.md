@@ -52,6 +52,7 @@ The install script:
 1. Loads the daemon via launchd (auto-starts on boot, auto-restarts on crash)
 2. Redirects the built-in telegram plugin to run tg-relay's `plugin.ts`
 3. Enables the plugin in Claude Code settings
+4. Installs a `PreToolUse` hook that suppresses Claude Code's `AskUserQuestion` picker (see [Why the multiple-choice picker is disabled](#why-the-multiple-choice-picker-is-disabled))
 
 Then add this alias to your `~/.zshrc`:
 
@@ -119,6 +120,19 @@ claude-channel-add mybot <BOT_TOKEN>
 ```
 
 The daemon picks up new channels automatically — no restart needed.
+
+### Why the multiple-choice picker is disabled
+
+Claude Code's `AskUserQuestion` tool renders an interactive arrow-key picker that reads input **only from the local terminal**. It is not an MCP call, so tg-relay never sees it and cannot forward it to Telegram — and there is no API, hook, or MCP path to feed an answer *back into* the blocked picker from outside the TTY. If Claude popped that picker in a phone-driven session, the session would hang with no way to answer.
+
+A question with N options is semantically identical to "ask in plain text, reply with a number," which routes through the normal Telegram message channel that already works. So `install.sh` ships a `PreToolUse` hook (`block-askuserquestion.sh`, installed into `~/.claude/hooks/` and registered in `~/.claude/settings.json`) that **denies `AskUserQuestion` outright** and hands Claude a reason instructing it to ask the question as a numbered list in its normal response instead.
+
+Notes:
+- This applies to **all** Claude Code sessions on the machine, not just channel-bound ones — you lose the keyboard picker locally too. Numbered prose is equivalent and works everywhere; gating on "am I remote right now?" isn't reliable, so we suppress globally.
+- Denying outright also sidesteps a known bug where enabling any `PreToolUse` hook strips the picker's answer ([anthropics/claude-code#12031](https://github.com/anthropics/claude-code/issues/12031)) — no result is ever produced.
+- The installer merges its matcher into the existing `PreToolUse` array idempotently; re-running `install.sh` won't duplicate it or disturb other hooks.
+
+> Note: this is a workaround. The clean fix would be for Claude Code to route `AskUserQuestion` through the same `claude/channel` mechanism it already uses for permission prompts (which tg-relay relays as tappable Allow/Deny buttons). That needs an upstream `claude/channel/question` capability.
 
 ### Channel resolution order
 
