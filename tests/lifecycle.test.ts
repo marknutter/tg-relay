@@ -309,13 +309,22 @@ setInterval(() => {}, 1 << 30)
  * it for cleanup.
  */
 function spawnTestDaemon(opts: { tmp: string; logFile: string; channelsRoot: string }) {
+  // daemon.ts only appends to LOG_FILE when XPC_SERVICE_NAME is unset; it
+  // treats the var as "running under launchd, which is already redirecting my
+  // stderr to the log file." GUI-launched shells (Ghostty/zellij/agy) export
+  // XPC_SERVICE_NAME=0, and `!!"0"` is truthy — so the inherited value makes
+  // the daemon skip the file write while the test pipes (and discards) stderr,
+  // leaving LOG_FILE empty and the log assertions reading "". Strip it so the
+  // daemon takes the explicit-file-logging path this test depends on. (#60)
+  const env = { ...process.env }
+  delete env.XPC_SERVICE_NAME
   return Bun.spawn(['bun', 'src/daemon.ts'], {
     cwd: REPO_ROOT,
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
     env: {
-      ...process.env,
+      ...env,
       TG_RELAY_CHANNELS_ROOT: opts.channelsRoot,
       TG_RELAY_LOG: opts.logFile,
       TG_RELAY_SCAN_INTERVAL: '5',
