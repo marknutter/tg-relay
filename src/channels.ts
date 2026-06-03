@@ -75,10 +75,13 @@ export function discoverChannels(): ChannelConfig[] {
 export function resolveChannelName(claudeCodeCwd: string): string | undefined {
   const home = homedir()
 
-  // Walk up looking for .claude-channel
+  // Walk up looking for .claude-channel or .gemini-channel
   let dir = claudeCodeCwd
   while (dir && dir.startsWith(home) && dir !== home) {
-    const channelFile = join(dir, '.claude-channel')
+    let channelFile = join(dir, '.claude-channel')
+    if (!existsSync(channelFile)) {
+      channelFile = join(dir, '.gemini-channel')
+    }
     if (existsSync(channelFile)) {
       try {
         const name = readFileSync(channelFile, 'utf8').trim()

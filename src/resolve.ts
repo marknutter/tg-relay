@@ -47,7 +47,10 @@ export function resolveChannel(deps: ResolveDeps): ChannelResolution {
 
   let dir = cwd
   while (dir && dir.startsWith(deps.homeDir) && dir !== deps.homeDir) {
-    const channelFile = `${dir}/.claude-channel`
+    let channelFile = `${dir}/.claude-channel`
+    if (!deps.pathExists(channelFile)) {
+      channelFile = `${dir}/.gemini-channel`
+    }
     if (deps.pathExists(channelFile)) {
       const content = deps.readFile(channelFile)
       if (content == null) {

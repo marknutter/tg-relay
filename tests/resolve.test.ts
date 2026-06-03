@@ -210,6 +210,41 @@ describe('resolveChannel — marker file present', () => {
       expect(mentionsReadFailure).toBe(true)
     }
   })
+
+  test('marker file is .gemini-channel if .claude-channel is missing → ok:true', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const cwd = '/Users/example/code/myproj'
+    const fs = makeFs()
+    addFile(fs, `${cwd}/.gemini-channel`, 'gemini-work\n')
+    addDir(fs, `${channelsRoot}/telegram-gemini-work`)
+
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs }))
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.name).toBe('gemini-work')
+      expect(result.cwdUsed).toBe(cwd)
+    }
+  })
+
+  test('.claude-channel takes precedence over .gemini-channel → ok:true with .claude-channel content', () => {
+    const home = '/Users/example'
+    const channelsRoot = '/Users/example/.tg-relay/channels'
+    const cwd = '/Users/example/code/myproj'
+    const fs = makeFs()
+    addFile(fs, `${cwd}/.claude-channel`, 'claude-win\n')
+    addFile(fs, `${cwd}/.gemini-channel`, 'gemini-lose\n')
+    addDir(fs, `${channelsRoot}/telegram-claude-win`)
+    addDir(fs, `${channelsRoot}/telegram-gemini-lose`)
+
+    const result = resolveChannel(makeDeps({ cwd, channelsRoot, homeDir: home, fs }))
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.name).toBe('claude-win')
+    }
+  })
 })
 
 // ── 8: walk boundaries ──────────────────────────────────────────────────
