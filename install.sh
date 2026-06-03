@@ -159,20 +159,17 @@ with open('$SETTINGS', 'w') as f:
 " 2>/dev/null && echo "   Enabled telegram plugin in settings (runs tg-relay code)."
 fi
 
-# 3b. Configure Gemini CLI (antigravity) if available
+# 3b. Configure Antigravity CLI (agy) if available
 echo ""
-echo "3b. Configuring Gemini CLI (antigravity)..."
-GEMINI_BIN="$(command -v gemini || true)"
-if [ -n "$GEMINI_BIN" ] && [ -x "$GEMINI_BIN" ]; then
-  if "$GEMINI_BIN" mcp add plugin_telegram_telegram "$BUN" "$PLUGIN_ENTRY" --scope user &>/dev/null; then
-    echo "   Registered tg-relay as MCP server 'plugin_telegram_telegram' in Gemini settings."
-  else
-    # Direct patch fallback
-    SETTINGS_GEMINI="$HOME/.gemini/settings.json"
-    mkdir -p "$(dirname "$SETTINGS_GEMINI")"
-    python3 -c "
+echo "3b. Configuring Antigravity CLI (agy)..."
+AGY_BIN="$(command -v agy || true)"
+if [ -n "$AGY_BIN" ] && [ -x "$AGY_BIN" ]; then
+  # Direct patch settings
+  SETTINGS_FILE="$HOME/.gemini/settings.json"
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+  python3 -c "
 import json, os
-path = '$SETTINGS_GEMINI'
+path = '$SETTINGS_FILE'
 data = {}
 if os.path.exists(path) and os.path.getsize(path) > 0:
     try:
@@ -186,10 +183,9 @@ data.setdefault('mcpServers', {})['plugin_telegram_telegram'] = {
 }
 with open(path, 'w') as f:
     json.dump(data, f, indent=4)
-" 2>/dev/null && echo "   Directly added plugin_telegram_telegram to $SETTINGS_GEMINI"
-  fi
+" 2>/dev/null && echo "   Directly added plugin_telegram_telegram to $SETTINGS_FILE"
 else
-  echo "   Gemini CLI not found on PATH. Skipping Gemini integration."
+  echo "   Antigravity CLI (agy) not found on PATH. Skipping Antigravity integration."
 fi
 
 # 4. Install claude-channel-add helper into ~/bin

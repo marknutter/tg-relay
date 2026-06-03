@@ -168,36 +168,31 @@ if (Test-Path $settingsFile) {
 
 # ── 3b. Configure Gemini CLI (antigravity) if available ───────────────────────
 Write-Host ""
-Write-Host "3b. Configuring Gemini CLI (antigravity)..."
+Write-Host "3b. Configuring Antigravity CLI (agy)..."
 
-$geminiCmd = Get-Command gemini -ErrorAction SilentlyContinue
-if ($geminiCmd) {
-  try {
-    & $geminiCmd.Source mcp add plugin_telegram_telegram $Bun `"$PluginEntry`" --scope user
-    Write-Host "   Registered tg-relay as MCP server 'plugin_telegram_telegram' in Gemini settings."
-  } catch {
-    $geminiHome = Join-Path $env:USERPROFILE '.gemini'
-    $geminiSettingsFile = Join-Path $geminiHome 'settings.json'
-    if (Test-Path $geminiSettingsFile) {
-      try {
-        $data = Get-Content $geminiSettingsFile -Raw | ConvertFrom-Json
-        if ($null -eq $data.mcpServers) {
-          $data | Add-Member -NotePropertyName 'mcpServers' -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
-        $serverObj = [pscustomobject]@{
-          command = $Bun
-          args    = @($PluginEntry)
-        }
-        $data.mcpServers | Add-Member -NotePropertyName 'plugin_telegram_telegram' -NotePropertyValue $serverObj -Force
-        Write-Utf8NoBom $geminiSettingsFile ($data | ConvertTo-Json -Depth 20)
-        Write-Host "   Directly added plugin_telegram_telegram to $geminiSettingsFile"
-      } catch {
-        Write-Host "   Warning: could not patch Gemini settings.json: $_"
+$agyCmd = Get-Command agy -ErrorAction SilentlyContinue
+if ($agyCmd) {
+  $geminiHome = Join-Path $env:USERPROFILE '.gemini'
+  $settingsFile = Join-Path $geminiHome 'settings.json'
+  if (Test-Path $settingsFile) {
+    try {
+      $data = Get-Content $settingsFile -Raw | ConvertFrom-Json
+      if ($null -eq $data.mcpServers) {
+        $data | Add-Member -NotePropertyName 'mcpServers' -NotePropertyValue ([pscustomobject]@{}) -Force
       }
+      $serverObj = [pscustomobject]@{
+        command = $Bun
+        args    = @($PluginEntry)
+      }
+      $data.mcpServers | Add-Member -NotePropertyName 'plugin_telegram_telegram' -NotePropertyValue $serverObj -Force
+      Write-Utf8NoBom $settingsFile ($data | ConvertTo-Json -Depth 20)
+      Write-Host "   Directly added plugin_telegram_telegram to $settingsFile"
+    } catch {
+      Write-Host "   Warning: could not patch Antigravity settings.json: $_"
     }
   }
 } else {
-  Write-Host "   Gemini CLI not found on PATH. Skipping Gemini integration."
+  Write-Host "   Antigravity CLI (agy) not found on PATH. Skipping Antigravity integration."
 }
 
 # ── 4. Install claude-channel-add helper ──────────────────────────────────────
