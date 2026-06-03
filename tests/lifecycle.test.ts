@@ -30,6 +30,12 @@ const REPO_ROOT = resolve(import.meta.dir, '..')
 // Track every spawned subprocess so afterEach can reliably tear them down.
 const tracked: Array<{ proc: any; label: string }> = []
 
+// Track bare PIDs of grandchildren we don't hold a Bun.spawn handle for
+// (e.g. the inner-stub spawned *inside* a stub script in T4). afterEach
+// SIGKILLs these too, so a thrown assertion mid-test can't leak a spinning
+// orphan. See issue #58.
+const trackedPids: number[] = []
+
 function track<T extends { kill: (signal?: any) => void; exited: Promise<number> }>(
   proc: T,
   label: string,
@@ -52,6 +58,13 @@ afterEach(async () => {
       ])
     } catch {
       /* ignore */
+    }
+  }
+  for (const pid of trackedPids.splice(0)) {
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      /* already dead */
     }
   }
 })
@@ -171,12 +184,20 @@ test('T4: plugin exits within 30s after grandparent (Claude Code stub) dies', as
 
   const tmp = mkdtempSync(join(tmpdir(), 'tgrelay-t4-'))
   const pidFile = join(tmp, 'plugin.pid')
+  const innerPidFile = join(tmp, 'inner.pid')
   const ccStubScript = join(tmp, 'cc-stub.ts')      // outer = Claude Code stand-in (grandparent)
   const innerStubScript = join(tmp, 'inner-stub.ts') // inner = bun parent that spawns plugin
 
   // Inner stub: this is the direct parent of the plugin (the "bun" wrapper
-  // Claude Code spawns the plugin under). It writes the plugin pid for the
-  // test to discover, then sleeps forever.
+  // Claude Code spawns the plugin under). It writes the plugin pid (and its
+  // own pid, so the test can reap it) then stays alive — deliberately, so the
+  // plugin's *parent* outlives the *grandparent* this test kills.
+  //
+  // Stay alive with a long no-op timer rather than `await new Promise(() => {})`.
+  // The promise form, combined with a `pipe` stdin, makes bun busy-poll the
+  // dead stdin fd once the grandparent closes the pipe — pegging a CPU core
+  // forever (issue #58). A timer keeps the event loop alive without spinning,
+  // and `stdin: 'ignore'` removes the pipe entirely.
   writeFileSync(
     innerStubScript,
     `
@@ -188,23 +209,26 @@ const proc = Bun.spawn(['bun', 'src/plugin.ts'], {
   stderr: 'ignore',
 })
 writeFileSync(${JSON.stringify(pidFile)}, String(proc.pid))
-await new Promise(() => {})
+writeFileSync(${JSON.stringify(innerPidFile)}, String(process.pid))
+setInterval(() => {}, 1 << 30)
 `,
   )
 
   // Outer stub: this is the "Claude Code" grandparent. It spawns the inner
-  // stub. When the test kills *this* process, the plugin's grandparent dies
-  // and the plugin must shut itself down within 30s.
+  // stub (stdin ignored so the inner stub can't busy-spin on a broken pipe
+  // when this process dies) and stays alive via a no-op timer. When the test
+  // kills *this* process, the plugin's grandparent dies and the plugin must
+  // shut itself down within 30s.
   writeFileSync(
     ccStubScript,
     `
 Bun.spawn(['bun', ${JSON.stringify(innerStubScript)}], {
   cwd: ${JSON.stringify(REPO_ROOT)},
-  stdin: 'pipe',
+  stdin: 'ignore',
   stdout: 'ignore',
   stderr: 'ignore',
 })
-await new Promise(() => {})
+setInterval(() => {}, 1 << 30)
 `,
   )
 
@@ -234,6 +258,17 @@ await new Promise(() => {})
   }
   expect(pluginPid).toBeDefined()
   if (!pluginPid) throw new Error('did not get plugin pid')
+
+  // Register helper pids for guaranteed teardown (issue #58). The inner-stub
+  // is spawned inside cc-stub, so we have no Bun.spawn handle for it — without
+  // this it leaks as a spinning orphan if anything below throws.
+  trackedPids.push(pluginPid)
+  try {
+    const innerPid = parseInt(readFileSync(innerPidFile, 'utf8').trim(), 10)
+    if (Number.isFinite(innerPid) && innerPid > 0) trackedPids.push(innerPid)
+  } catch {
+    /* inner pid not written yet; afterEach still kills cc-stub + plugin */
+  }
 
   // Give plugin a beat to discover its grandparent and start its watcher.
   await sleep(2000)
