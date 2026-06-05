@@ -96,6 +96,46 @@ Get-Content $env:USERPROFILE\.claude\channels\telegram-router.log -Tail 40 -Wait
 
 The `--channels` flag is required — without it, Claude Code silently drops channel notifications.
 
+### Installing on an additional machine
+
+To set tg-relay up on another machine (e.g. a second Mac), or to pull in the
+latest changes on a machine that already runs it:
+
+```bash
+cd ~/Code/tg-relay   # or wherever you clone it
+git pull
+bun install          # if deps aren't already present
+./install.sh
+```
+
+`install.sh` wires up the daemon, plugin hijack, and the `AskUserQuestion`
+suppression hook. It can't do everything for you, though — check its output and
+finish these per-machine steps:
+
+1. **Shell alias** — add the `claude!` alias (macOS) or function (Windows) shown
+   above to your shell profile if it isn't there yet.
+2. **`~/bin` on `PATH`** — required for the `claude-channel-add` helper.
+   `install.sh` warns if it's missing.
+3. **Per-channel tokens** — `~/.claude/channels/telegram-<name>/` configs hold
+   bot tokens and are **not** in the repo. Set them up per project on each
+   machine with `claude-channel-add <name> <token>` (see [Adding a new
+   project](#adding-a-new-project)).
+
+Two gotchas specific to a fresh machine:
+
+- **The plugin hijack needs the cached plugin present.** Step 2 redirects
+  `~/.claude/plugins/cache/claude-plugins-official/telegram/*/.mcp.json`. If
+  `telegram@claude-plugins-official` was never installed in Claude Code on that
+  machine, the installer prints `Warning: built-in telegram plugin not found in
+  cache` and has nothing to hijack — install/enable that plugin first, then
+  re-run `install.sh`.
+- **The hook only affects sessions started _after_ install.** Existing Claude
+  Code sessions keep the config they loaded at startup; open a new session to
+  pick up the `AskUserQuestion` suppression.
+
+If the machine already runs tg-relay and you're just pulling in the hook,
+`git pull && ./install.sh` is all you need.
+
 ## Usage
 
 Once installed, `claude!` from any project directory auto-connects to the right bot via the daemon. No env vars needed — the plugin resolves the channel from Claude Code's cwd.
