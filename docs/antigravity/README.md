@@ -100,6 +100,44 @@ Phone → Telegram → tg-relay daemon (already exists)
   `GetSidecarEvents`) for assistant turns → daemon → Telegram `reply`.
 - **Seamless CLI**: nothing extra — the CLI resumes the same `conversations/<id>.db`.
 
+## Spike run log (2026-06-05) — inconclusive, blocked on CLI auth
+
+First real run of the echo-sidecar spike on the work account. **No capture file
+appeared and agy logged nothing about sidecars** — but this was a test-design
+problem, not a feature block. What we learned:
+
+- **Sidecars are NOT disabled in this external build.** The only externally
+  stubbed features are Jetbox/ModelAPIClient bits. The full sidecar lifecycle is
+  present and live in the binary (`SidecarManager`, `Sidecar %s completed
+  successfully`, `Retrying sidecar %s`, `Migrating legacy sidecars directory`,
+  `failed to get agent api injection`).
+- **`SidecarManager` initializes _after auth_** (binary: `Failed to initialize
+  SidecarManager after auth`). The test sessions were **not authenticated** — the
+  startup log shows `error getting token source: You are not logged into
+  Antigravity.` repeatedly. No auth ⇒ manager never starts ⇒ the sidecars dir is
+  never scanned ⇒ our sidecar is never seen ⇒ zero log output. Consistent with
+  what we observed exactly.
+- **The `agy` CLI authenticates separately from the Antigravity IDE/app**, via
+  `LoginWithBrowser` (OAuth browser flow on interactive launch). There is no
+  `agy login` subcommand. Being "logged into the work account" in the IDE does
+  not mean the CLI session is authenticated.
+- **`agy -p` (print) and one-shot `-i` did not produce an authenticated, watcher-
+  running session.** Need a plain interactive `agy` that completes the browser
+  login.
+
+### Manifest correction applied
+`sidecar.json` originally lacked `"enabled": true`; the binary has a `"sidecar %s
+is disabled"` path and an `enabled` field, so it's been added. (Couldn't confirm
+it was the cause, since auth blocked the test first.)
+
+### Decisive next test (must be authenticated)
+1. `agy` (plain interactive) → complete the browser login if prompted; confirm
+   it answers with work models and stops logging "not logged into Antigravity."
+2. Leave it open ~15s, send one message.
+3. `./run-spike.sh status` → look for `PASS` + the injected env vars.
+4. If STILL silent under a confirmed-authenticated session → that is the real
+   enterprise-policy block; stop there.
+
 ## Open risks (verify before building — do not skip)
 
 1. **Enterprise/`ultra` account lockdown (biggest unknown).** The work account

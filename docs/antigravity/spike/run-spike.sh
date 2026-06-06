@@ -63,11 +63,22 @@ case "$cmd" in
       done
     else
       echo "(no captures yet — sidecar hasn't launched)"
-      echo "Is an agy session running? Try:  agy -p \"say hi\""
+      echo "NOTE: 'agy -p' (print mode) runs one prompt and exits; it may not start"
+      echo "the sidecar directory watcher. Use a real interactive session instead:"
+      echo "    agy -i \"say hi\"      # interactive; leave it open ~10s, then re-run status"
     fi
     echo
-    echo "=== Antigravity's own sidecar logs (if any) ==="
-    ls -la "$AG_DATADIR/log" 2>/dev/null | grep -i sidecar || echo "(none found; check $AG_DATADIR/log)"
+    echo "=== did the agy language server notice the sidecar? (grep its logs) ==="
+    # The sidecar manager runs in the agy process; it logs to cli-*.log. A
+    # 'disabled' / 'starting sidecar' / error line tells us whether the manifest
+    # was seen and accepted.
+    if compgen -G "$AG_DATADIR/log/cli-*.log" >/dev/null; then
+      grep -hinE "sidecar|tgrelay-spike|SidecarManager" "$AG_DATADIR"/log/cli-*.log 2>/dev/null \
+        | grep -ivE "RecordSidecarEvent|GetSidecarEvents" | tail -20 \
+        || echo "(no sidecar mentions in any cli-*.log — manager likely never scanned)"
+    else
+      echo "(no cli-*.log files found in $AG_DATADIR/log)"
+    fi
     ;;
 
   teardown)
