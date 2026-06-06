@@ -166,6 +166,58 @@ it was the cause, since auth blocked the test first.)
 4. If STILL silent under a confirmed-authenticated session → that is the real
    enterprise-policy block; stop there.
 
+## MCP-plugin test (the path the official docs point to)
+
+The sidecar/agentapi investigation above missed the **officially documented**
+extension mechanism: **plugins**, which bundle `mcp_config.json` (MCP servers)
+and `hooks.json` (event hooks) under
+`~/.gemini/antigravity-cli/plugins/<name>/` (see antigravity.google/docs →
+"Plugins & Skills"; there's also a live `/mcp` slash command). Because
+tg-relay's real Claude Code plugin **is** an MCP server, this is the most
+promising path for the INBOUND bridge — and unlike sidecars, it's blessed, not
+reverse-engineered.
+
+`spike/mcp-test/` is a decisive probe: a trivial MCP server (`probe-server.ts`,
+structured like the real `src/plugin.ts`) packaged as a plugin
+(`plugin.json` + `mcp_config.json`). It logs three checkpoints to
+`~/.cache/tgrelay-mcp-probe/events.log` — `SPAWNED` (agy launched it), `BOOTED`
+(MCP initialize handshake completed), `TOOL_CALL` (agy invoked its tool) — and
+exposes one tool, `tgrelay_probe_ping`.
+
+Self-test (driving it with a raw MCP handshake) passes: SPAWNED → BOOTED →
+LIST_TOOLS → TOOL_CALL all fire. So the probe is sound; any failure under agy is
+agy's MCP loading, not the probe.
+
+### Running it (needs an AUTHENTICATED interactive agy session)
+```bash
+cd docs/antigravity/spike/mcp-test
+./run-mcp-test.sh deploy
+./run-mcp-test.sh validate        # agy plugin validate + list
+agy                               # authenticated interactive session
+  > /mcp                          # is 'tgrelay-mcp-probe' listed/connected?
+  > call the tgrelay_probe_ping tool with note=hello
+./run-mcp-test.sh status          # PASS = SPAWNED+BOOTED+TOOL_CALL
+./run-mcp-test.sh teardown
+```
+
+### Interpreting
+- **PASS (TOOL_CALL logged)** → agy loads and uses MCP plugins ⇒ the inbound
+  bridge is viable. Next: package tg-relay's real `plugin.ts` as a plugin, then
+  pair it with `/schedule` (poll for messages) for phone→agy. NOTE: standard MCP
+  gives the agent *tools to call* (pull); it does not natively *push* a message
+  into the conversation the way Claude Code's channel-notification capability
+  does — hence MCP-tool + `/schedule`-heartbeat as the combo.
+- **PARTIAL (SPAWNED/BOOTED, no TOOL_CALL)** → loads but the agent didn't call
+  the tool; just ask it to, then re-check.
+- **SPAWNED only / nothing** → MCP loading is inert or the `mcp_config.json`
+  schema differs in this build. Check `agy plugin list` + `/mcp` panel + cli logs.
+
+### Known assumption
+`mcp_config.json` uses the standard `{"mcpServers": {...}}` shape (same as the
+stale `~/.gemini/settings.json` entry from the #64 attempt). The docs show the
+*filename* but not the inner schema; if agy spawns nothing, this is the first
+thing to adjust.
+
 ## Open risks (verify before building — do not skip)
 
 1. **Enterprise/`ultra` account lockdown (biggest unknown).** The work account
