@@ -1,0 +1,161 @@
+# Antigravity (Gemini CLI) integration research
+
+> Status: **research + unproven spike.** No integration shipped. This captures
+> what we learned probing the installed binary so it isn't re-derived a third
+> time (the first attempt, PR #64, was closed as a dead end on a wrong premise —
+> see "Correcting the record" below).
+>
+> Last updated from `agy`/`gemini-cli` as installed on 2026-06-05.
+
+## TL;DR
+
+The premise "Antigravity is closed-source and has no API/hooks, so tg-relay
+can't work with it" is **wrong**. The Antigravity CLI ships a first-class,
+documented **sidecar** mechanism plus an **`agentapi`** programmatic interface
+and **persistent per-conversation storage** — the same architectural ingredients
+tg-relay already relies on for Claude Code. The open question is not "is there a
+seam" but "does the **work / enterprise (`ultra`) account** policy allow using
+it, and is the undocumented interface stable enough to build on." The spike in
+`spike/` answers the first of those in ~15 minutes.
+
+## What Antigravity actually is
+
+- A **Codeium / Windsurf-derived agent** (backend services are `exa.*` gRPC, the
+  agent core is "Jetski" / "Cortex") wrapped in a Go CLI named `agy`, running
+  **Claude Opus** models on the user's Google account credits.
+- Two distinct things share the `~/.gemini` config root and must not be confused:
+  - **`gemini`** — the open-source `@google/gemini-cli` (Homebrew). Has its own
+    `gemini mcp`, `gemini hooks`, `gemini skills`, `--experimental-acp`.
+  - **`agy`** — the Antigravity CLI at `~/.local/bin/agy`, data dir
+    `~/.gemini/antigravity-cli/`. This is the harness the user is required to use.
+- Architecture mirrors tg-relay's own: a **long-lived local server per session**
+  listening on `127.0.0.1:<port>`, addressed by `ANTIGRAVITY_LS_ADDRESS`, auth'd
+  by `ANTIGRAVITY_CSRF_TOKEN`. gRPC service: `exa.language_server_pb.LanguageServerService`.
+
+## The integration seam (all confirmed from binary strings)
+
+### Sidecars — the supported extension point
+- Quote: *"Background sidecars can use the agentapi CLI tool to programmatically
+  interact with the system."*
+- **Location**: `<datadir>/sidecars/<name>/` i.e.
+  `~/.gemini/antigravity-cli/sidecars/<name>/`.
+- **Manifest**: `sidecar.json` (Required) — `{command, args, restart_policy,
+  description}`. `restart_policy` seen values: `always`, `never`.
+- **Hot-reload**: *"The server is constantly watching the directory. If a sidecar
+  is deleted, the server will kill the command. If added or edited, it will start
+  or restart the command."* (Go: `SidecarManager.CreateSidecar/DeleteSidecar`,
+  fsnotify.) Same model as tg-relay's channel discovery.
+- **Env injected into sidecars**: `ANTIGRAVITY_LS_ADDRESS`,
+  `ANTIGRAVITY_CSRF_TOKEN`, `ANTIGRAVITY_PROJECT_ID`. **Critically, these are NOT
+  in the top-level session env** — verified against a running session. They are
+  injected only into child processes Antigravity spawns. ⇒ a tg-relay adapter
+  must run **as a sidecar**, not as an external poller reaching in. (Same pattern
+  Claude Code uses for hook/MCP subprocesses.)
+
+### agentapi — the programmatic RPC surface
+- CLI: `agy agentapi ...` (a wrapper at `~/.gemini/antigravity-cli/bin/agentapi`
+  → `agy agentapi`). Refuses to run unless `ANTIGRAVITY_LS_ADDRESS` is set ⇒
+  it's meant to be invoked *from inside a sidecar*.
+- Handlers seen: `newConversation`, `sendMessage`, `getConversationMetadata`,
+  `Get`, `Register`; related RPCs `GetSidecarEvents`, `SendAgentMessage`,
+  `ForkConversation`, `GetModelResponse`, `SearchConversations`.
+- **Events stream (inbound half)**: *"For every agentapi call, a timestamped
+  .json file is created in the events/ subdirectory."* Plus `GetSidecarEvents` /
+  `SubscribeToSidecars` RPCs.
+- Built-in **scheduler**: sidecars can be cron-like, e.g. the binary's own
+  example `{"builtin":"schedule","args":["30 9 * * *","agentapi",
+  "new-conversation","check my messages"],"restart_policy":"always"}`.
+
+### Persistence — the key to "seamless CLI ↔ Telegram"
+- Each conversation is a **SQLite db**: `conversations/<uuid>.db`.
+- Index: `history.jsonl`, one row per turn:
+  `{display, timestamp, workspace, conversationId}`.
+- Resume from the CLI: `agy --conversation <id>` or `agy --continue` / `-c`.
+- ⇒ The persistence layer **is** the handoff. Drive from Telegram via
+  `agentapi sendMessage` against conversation `<id>`; sit down and run
+  `agy --conversation <id>` to continue the *same* conversation. No bespoke
+  handoff protocol needed — both are clients of the same on-disk session. This is
+  the Codeium/Windsurf shared-session model.
+
+## Proposed integration shape (for full bidirectional parity)
+
+Goal: drive an Antigravity session from Telegram and seamlessly continue at the
+CLI, the way tg-relay does for Claude Code.
+
+```
+Phone → Telegram → tg-relay daemon (already exists)
+                      │  (new) Antigravity adapter
+                      ▼
+        agentapi sendMessage / newConversation   ── outbound ──▶ agy session
+        watch events/ + GetSidecarEvents          ◀── inbound ──   (Claude Opus)
+                      ▲
+        adapter runs AS an Antigravity sidecar  (gets LS_ADDRESS + CSRF_TOKEN)
+                      │
+        conversations/<id>.db  ←── shared ──→  `agy --conversation <id>` (CLI)
+```
+
+- **Outbound** (Telegram → Antigravity): daemon → adapter → `agentapi
+  sendMessage`/`newConversation`.
+- **Inbound** (Antigravity → Telegram): adapter tails `events/` (and/or
+  `GetSidecarEvents`) for assistant turns → daemon → Telegram `reply`.
+- **Seamless CLI**: nothing extra — the CLI resumes the same `conversations/<id>.db`.
+
+## Open risks (verify before building — do not skip)
+
+1. **Enterprise/`ultra` account lockdown (biggest unknown).** The work account
+   may disable sidecars / agentapi / plugins by policy. The spike tests this
+   directly and cheaply. Until it passes, everything above is conditional.
+2. **Undocumented + closed-source + auto-updating.** The RPC shapes come from
+   binary strings, not a spec. `agy update` can change the interface under us.
+   We'd be building on a surface the vendor can repave without notice.
+3. **The `ask_question` picker problem returns.** The binary contains
+   *"Auto-answering ask_question at step %d with skipped=true"* — Antigravity has
+   the same interactive-question concept as Claude Code's AskUserQuestion, so the
+   "unanswerable from Telegram" issue recurs. The Claude Code deny-redirect hook
+   does NOT transfer (different harness). But Antigravity has its own hooks system
+   (`gemini hooks migrate` imports Claude Code hooks; binary loads `hooks.json`),
+   so a parallel mitigation likely exists. Needs its own investigation.
+
+## The spike (`spike/`)
+
+Proves risk #1 (and partially #2) in ~15 min by registering a trivial sidecar
+that records the env Antigravity injects — without making any agentapi calls.
+
+- `echo-sidecar.sh` — the sidecar command; captures `ANTIGRAVITY_*` env to
+  `/tmp/ag-echo-sidecar/launch-*.txt` and prints PASS/FAIL.
+- `sidecar.json` — the manifest (`restart_policy: never`).
+- `run-spike.sh deploy|status|teardown` — the operator runs this; it copies the
+  spike into `~/.gemini/antigravity-cli/sidecars/tgrelay-spike/`, then reads back
+  the capture. **Run it yourself** — the sidecars dir is global, so deploying
+  affects any running `agy` session.
+
+### Running it
+```bash
+cd docs/antigravity/spike
+./run-spike.sh deploy
+# a running `agy` session picks it up within seconds; or start one:
+agy -p "say hi"
+./run-spike.sh status     # look for "PASS: integration seam is open"
+./run-spike.sh teardown
+```
+
+### Interpreting
+- **PASS** (address + token present) → the seam is open on this account; proceed
+  to scope the real adapter (next: a read-only `agentapi getConversationMetadata`
+  probe, then `events/` format capture).
+- **FAIL / MISSING** → either the account blocks it (likely enterprise policy) or
+  the env-var names differ on this build. If the latter, check
+  `~/.gemini/antigravity-cli/log/` and adjust `echo-sidecar.sh`.
+
+## Correcting the record (why PR #64 was a false dead end)
+
+PR #64 ("Add support for Gemini CLI (Antigravity)") was closed on the premise
+that Antigravity is closed-source with no usable hooks. That conflated the
+open-source `gemini` CLI with `agy`, and missed the sidecar/agentapi seam
+entirely. It also wired `install.sh` to register tg-relay's *Claude Code* plugin
+as a `gemini mcp` server — which doesn't address the actual relay problem
+(inbound message delivery + session lifecycle). The real path is the sidecar
+adapter described here, pending the spike. Note: the stale
+`~/.gemini/settings.json` may still contain a `plugin_telegram_telegram` MCP
+entry from that attempt, pointing at a wrong `Kode/tg-relay` path — harmless but
+worth cleaning up.
