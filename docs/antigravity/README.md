@@ -7,7 +7,50 @@
 >
 > Last updated from `agy`/`gemini-cli` as installed on 2026-06-05.
 
-## VERDICT (2026-06-05): integration not viable on this build. Spike concluded.
+## BREAKTHROUGH (2026-06-06): MCP via global config WORKS — inbound bridge viable
+
+The sidecar/agentapi verdict below stands, but it was the wrong door. The
+**officially documented** path — MCP servers — works end-to-end. Confirmed:
+
+```
+SPAWNED → BOOTED → LIST_TOOLS → TOOL_CALL name=tgrelay_probe_ping note=hello
+```
+
+agy spawned our MCP server, completed the initialize handshake, discovered the
+tool, and the agent successfully invoked it (replied `TGRELAY_MCP_PROBE_OK`).
+
+### What worked (and the one gotcha)
+- Plugin-dir `mcp_config.json` alone: agy **loads & connects** the server
+  (SPAWNED/BOOTED/LIST_TOOLS) and stages the tool schema to
+  `~/.gemini/antigravity-cli/mcp/<server>/`, **but the agent can't call the tool**
+  — "server is not allowed in this context" / "tool is not enabled."
+- **Fix: register the server in the GLOBAL config**
+  `~/.gemini/config/mcp_config.json` (standard `{"mcpServers": {...}}` shape).
+  After that + a **fresh session** (MCP connects at session start), the tool call
+  succeeds.
+- So: plugin dir = discovery/staging; global config = the enablement that lets
+  the agent actually call it. (A project `.gemini/settings.json` is the likely
+  per-workspace alternative, untested.)
+
+### Why this matters
+tg-relay's real Claude Code integration IS an MCP server (`src/plugin.ts`). agy
+loading+calling MCP tools means the same code can expose tools (reply, react,
+…) to Antigravity. Outbound (agy→Telegram) is then a tool call; inbound
+(Telegram→agy) pairs an MCP tool with `/schedule` polling (MCP is pull, not
+push — see note in the MCP-plugin test section).
+
+### Confirmed integration map
+| Path | Status |
+|---|---|
+| Sidecars | DEAD (SidecarManager never inits) |
+| agentapi direct | DEAD (CSRF token never on disk) |
+| **MCP via global config** | **WORKS** |
+| Outbound shell (curl/hooks) | works (agy runs shell) |
+| `/schedule` | documented official slash command |
+
+---
+
+## VERDICT (2026-06-05): SIDECAR path not viable. (Superseded by MCP breakthrough above.)
 
 The sidecar/agentapi seam exists in the binary's code and docs but is **disabled
 at runtime** in the external Antigravity build (1.0.6) on the Ultra for Business
