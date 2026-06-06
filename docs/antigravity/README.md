@@ -7,16 +7,44 @@
 >
 > Last updated from `agy`/`gemini-cli` as installed on 2026-06-05.
 
-## TL;DR
+## VERDICT (2026-06-05): integration not viable on this build. Spike concluded.
+
+The sidecar/agentapi seam exists in the binary's code and docs but is **disabled
+at runtime** in the external Antigravity build (1.0.6) on the Ultra for Business
+account. Two independent blockers, both confirmed empirically:
+
+1. **Sidecar manager never initializes.** With a fully authenticated live session
+   (`mark.nutter@evereve.com`, Ultra for Business, Claude Opus 4.6), rewriting the
+   deployed `sidecar.json` in place to fire the fsnotify directory-watcher
+   produced **zero reaction** — no log line, no launch, no capture. The post-auth
+   startup sequence initializes trajectory / experiment / CLI-store / model-config
+   / cascade / codeAssist managers but **NOT `SidecarManager`**. An explicit
+   `"Operation is not implemented, or supported, or enabled."` line appears. This
+   is a feature compiled-in but switched off in the external build.
+2. **Direct `agentapi` is also blocked.** The LS address is discoverable
+   (`lsof` on the running agy → `127.0.0.1:<port>`), but `agentapi` also requires
+   `ANTIGRAVITY_CSRF_TOKEN`, which is **never written to disk** — it exists only
+   as env injected into Antigravity-spawned children. No sidecar launch ⇒ no
+   token ⇒ no authenticated agentapi calls.
+
+**Consequence:** the clean data-layer integration is unavailable. Remaining
+options are screen-scraping the TUI (brittle; not recommended) or **waiting** —
+the feature is coded, just disabled, so a future `agy update` may enable it. Re-run
+the spike (`spike/run-spike.sh`) after any update to detect that instantly.
+
+The historical research below remains accurate about the *architecture*; only the
+runtime availability changed the conclusion.
+
+---
+
+## Original premise (still architecturally accurate)
 
 The premise "Antigravity is closed-source and has no API/hooks, so tg-relay
-can't work with it" is **wrong**. The Antigravity CLI ships a first-class,
-documented **sidecar** mechanism plus an **`agentapi`** programmatic interface
-and **persistent per-conversation storage** — the same architectural ingredients
-tg-relay already relies on for Claude Code. The open question is not "is there a
-seam" but "does the **work / enterprise (`ultra`) account** policy allow using
-it, and is the undocumented interface stable enough to build on." The spike in
-`spike/` answers the first of those in ~15 minutes.
+can't work with it" is **architecturally wrong** — the Antigravity CLI *ships* a
+first-class **sidecar** mechanism, an **`agentapi`** interface, and **persistent
+per-conversation storage**. The catch (see VERDICT above) is that the sidecar
+manager is disabled at runtime in the external build, so the seam can't actually
+be used today. The spike in `spike/` re-detects availability in ~15 minutes.
 
 ## What Antigravity actually is
 
