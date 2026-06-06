@@ -50,7 +50,16 @@ record('SPAWNED', `argv=${process.argv.slice(2).join(' ')}`)
 
 const mcp = new Server(
   { name: 'tgrelay-mcp-probe', version: '0.0.1' },
-  { capabilities: { tools: {} } },
+  {
+    // Declare logging so notifications/message is allowed, and advertise the
+    // channel experimental capability the way tg-relay's real plugin does, in
+    // case agy gates channel push on the server advertising it.
+    capabilities: {
+      tools: {},
+      logging: {},
+      experimental: { 'claude/channel': {} },
+    },
+  },
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -96,6 +105,90 @@ await mcp.connect(transport)
 record('BOOTED', 'MCP stdio transport connected')
 
 process.stderr.write('tgrelay-mcp-probe: connected\n')
+
+// ── PUSH TEST ────────────────────────────────────────────────────────────────
+// The real question: does agy honor a SERVER-INITIATED notification — i.e. can
+// the MCP server wake/notify an idle agy session WITHOUT the agent first calling
+// a tool? That's the difference between true push (Claude Code's channel model,
+// via notifications/claude/channel) and pull (agent must poll a tool).
+//
+// We fire a few notifications a few seconds after boot, while the user sits idle
+// in the session, and record each emit (PUSH_SENT). The operator watches the agy
+// UI: if anything surfaces / the agent reacts, push works. If the session stays
+// silent, agy ignores server-initiated notifications when idle → pull-only.
+//
+// We try multiple notification flavors because we don't know which (if any) agy
+// listens for:
+//   - tools/list_changed: standard MCP capability-change notification
+//   - message (logging): standard MCP logging notification
+//   - notifications/claude/channel: tg-relay's own channel push (the one Claude
+//     Code honors) — long shot, but it's the exact mechanism we'd use for real.
+//
+// PUSH_OBSERVED can't be detected from inside the server — only the operator can
+// see whether agy's UI reacted. The server's job is just to emit + log that it
+// emitted, so we can correlate timing against what the operator sees.
+
+async function emitPush(label: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn()
+    record('PUSH_SENT', label)
+    process.stderr.write(`tgrelay-mcp-probe: pushed ${label}\n`)
+  } catch (e) {
+    record('PUSH_ERR', `${label}: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+async function emitRound(round: number): Promise<void> {
+  // 1. Standard MCP: tool list changed (a capability-change signal).
+  await emitPush(`r${round}:tools/list_changed`, () =>
+    mcp.notification({ method: 'notifications/tools/list_changed' }),
+  )
+  // 2. Standard MCP: a logging message notification.
+  await emitPush(`r${round}:logging/message`, () =>
+    mcp.notification({
+      method: 'notifications/message',
+      params: {
+        level: 'info',
+        data: `TGRELAY_PUSH_TEST round ${round}: server-initiated notification — if you see this in agy without calling a tool, PUSH WORKS.`,
+      },
+    }),
+  )
+  // 3. The real one: tg-relay's channel notification, exactly as src/plugin.ts
+  //    emits it for Claude Code. If agy honors this, the real plugin Just Works.
+  await emitPush(`r${round}:claude/channel`, () =>
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `TGRELAY_PUSH_TEST round ${round}: simulated inbound Telegram message via channel push. If agy surfaces/reacts to this while idle, true push works.`,
+        meta: { chat_id: 'probe', user: 'push-test', user_id: '0', ts: 'probe' },
+      },
+    }),
+  )
+}
+
+// Fire several rounds, the first at PUSH_DELAY_MS (default 20s) so the session is
+// genuinely idle (not still answering the user's kickoff message), then repeat a
+// few times to give a wide observation window. Override with PUSH_DELAY_MS /
+// PUSH_ROUNDS / PUSH_INTERVAL_MS.
+const PUSH_DELAY_MS = Number(process.env.PUSH_DELAY_MS ?? 20000)
+const PUSH_ROUNDS = Number(process.env.PUSH_ROUNDS ?? 3)
+const PUSH_INTERVAL_MS = Number(process.env.PUSH_INTERVAL_MS ?? 10000)
+
+record('PUSH_SCHEDULED', `first at ${PUSH_DELAY_MS}ms, ${PUSH_ROUNDS} rounds every ${PUSH_INTERVAL_MS}ms`)
+
+let round = 0
+function scheduleRound(delay: number): void {
+  setTimeout(() => {
+    void (async () => {
+      round += 1
+      await emitRound(round)
+      record('PUSH_ROUND_DONE', `round ${round}/${PUSH_ROUNDS} emitted; watch agy UI`)
+      if (round < PUSH_ROUNDS) scheduleRound(PUSH_INTERVAL_MS)
+      else record('PUSH_DONE', 'all rounds emitted')
+    })()
+  }, delay)
+}
+scheduleRound(PUSH_DELAY_MS)
 
 // Keep alive until agy closes stdin (session ends).
 process.stdin.on('close', () => {

@@ -7,7 +7,61 @@
 >
 > Last updated from `agy`/`gemini-cli` as installed on 2026-06-05.
 
-## BREAKTHROUGH (2026-06-06): MCP via global config WORKS — inbound bridge viable
+## THE ANSWER (2026-06-06): drive agy at the terminal layer (tmux PTY). Both directions confirmed.
+
+After MCP proved pull-only (no push, ruinous idle token cost — see below), the
+**terminal/PTY layer** delivered everything MCP couldn't. Both halves tested and
+PASS:
+
+- **Inbound (test1-send-keys.sh): `tmux send-keys` drives agy.** Injected a
+  prompt into a detached tmux agy session; agy received it and replied. This is
+  **real push** — a daemon injects the instant a Telegram message arrives.
+  Event-driven, **zero idle token cost** (the polling dealbreaker is gone).
+- **Outbound (test2-transcript-tail.sh): agy's reply captured from the
+  transcript JSONL** at `~/.gemini/antigravity-cli/brain/<id>/.system_generated/
+  logs/transcript_full.jsonl` (assistant turn = `source=MODEL`,
+  `type=PLANNER_RESPONSE`, `status=DONE`, `content=<text>`). Clean structured
+  text in ~7s, no ANSI screen-scraping. (Pane `capture-pane` is an instant
+  fallback source if the transcript ever lags.)
+
+### Why this beats every other path
+| Need | MCP / sidecar | **PTY (tmux)** |
+|---|---|---|
+| Inbound push (wake idle agy) | DEAD | **WORKS (send-keys)** |
+| Idle token cost | ruinous (poll ~70M/day) | **zero (event-driven)** |
+| ask_question picker | unanswerable remotely | **inject the answer** |
+| CLI<->phone handoff | n/a | **shared tmux session** |
+| Outbound | tool call (pull) | transcript tail / pane |
+
+### Architecture (for an Antigravity tg-relay adapter)
+```
+Phone -> Telegram -> tg-relay daemon
+   inbound:  daemon `tmux send-keys -t agy <message>`   (event-driven push)
+   outbound: daemon tails brain/<id>/.../transcript_full.jsonl for new
+             source=MODEL/PLANNER_RESPONSE turns -> Telegram reply
+   handoff:  agy runs in tmux session 'agy'; you `tmux attach -t agy`
+             (run that tmux pane inside zellij — do NOT nest zellij-in-zellij)
+```
+
+### Still-open / known issues before building
+- **Turn-gating**: detect when agy is idle vs mid-turn so the daemon doesn't
+  inject mid-response. Watch transcript for a completed assistant turn, or the
+  pane's input-prompt state.
+- **Multi-line / paste**: long Telegram messages need `paste-buffer` or careful
+  send-keys (bracketed paste). Single-line worked cleanly.
+- **ask_question picker**: now tractable (inject arrow keys / a number) but needs
+  detection + mapping.
+- **Brittleness**: bespoke, rides on agy's TUI + transcript behavior across
+  updates. Anchoring outbound to the JSONL (structured) limits the blast radius
+  vs. screen-scraping.
+- **conversation id**: the daemon needs the active conv id to find the right
+  transcript; resolve from newest brain/ dir or `agy --conversation`.
+
+The MCP findings below remain accurate but are superseded for the relay use case.
+
+---
+
+## MCP via global config WORKS for tool calls (pull only — superseded by PTY for the relay)
 
 The sidecar/agentapi verdict below stands, but it was the wrong door. The
 **officially documented** path — MCP servers — works end-to-end. Confirmed:
@@ -39,14 +93,41 @@ loading+calling MCP tools means the same code can expose tools (reply, react,
 (Telegram→agy) pairs an MCP tool with `/schedule` polling (MCP is pull, not
 push — see note in the MCP-plugin test section).
 
-### Confirmed integration map
+### Push test (2026-06-06): server-initiated notifications are IGNORED
+
+Tested whether the MCP server can wake/notify an IDLE agy session without the
+agent first calling a tool (true push, like Claude Code's channel model). The
+probe emitted three notification flavors — `notifications/tools/list_changed`,
+`notifications/message` (logging), and tg-relay's own
+`notifications/claude/channel` — in 3 rounds at 20s/30s/40s into a genuinely idle
+session. **agy surfaced nothing for any round.** Confirmed twice (4s and 20s
+delays). This is architectural: agy is a turn-based MCP client; it acts on the
+agent's turn and does not honor server-initiated push, including the custom
+`claude/channel` method Claude Code specifically built a listener for.
+
+**Consequence:** inbound is **pull-only**. The agent receives a message only when
+*it* calls a tool. Real-time push (message arrives → idle agy reacts) is not
+possible. The realistic inbound design is an MCP "get pending messages" tool +
+`/schedule` polling (≤ poll-interval latency).
+
+### Confirmed integration map (FINAL)
 | Path | Status |
 |---|---|
+| MCP server load + tool CALLS (pull) | **WORKS** (via global `~/.gemini/config/mcp_config.json` + fresh session) |
+| Outbound (agy → phone) | works (tool call, or shell `curl`/hooks) |
+| `/schedule` (recurring trigger) | documented official slash command |
+| **Push** (wake idle agy from outside) | **DEAD** — server notifications ignored |
 | Sidecars | DEAD (SidecarManager never inits) |
 | agentapi direct | DEAD (CSRF token never on disk) |
-| **MCP via global config** | **WORKS** |
-| Outbound shell (curl/hooks) | works (agy runs shell) |
-| `/schedule` | documented official slash command |
+
+### What an Antigravity tg-relay would therefore look like
+- **Outbound**: trivial — an MCP `reply` tool (or a GEMINI.md/hook curl). Ship anytime.
+- **Inbound**: an MCP `get_pending_messages` tool over tg-relay's daemon + a
+  `/schedule` poll (e.g. every 30s) that calls it and acts on anything new.
+  Polled, not real-time; no idle-wake. Workable but a lesser experience than the
+  Claude Code channel push.
+- **Picker problem** (`ask_question`) recurs and the Claude Code hook does not
+  transfer; needs separate handling.
 
 ---
 
