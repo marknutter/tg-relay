@@ -12,8 +12,16 @@
  * via `bun src/plugin.ts` / `bun src/daemon.ts` and observed externally.
  */
 
-import { test as baseTest, expect, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { test as baseTest, expect, afterEach, beforeAll } from 'bun:test'
+import {
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  statSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -26,6 +34,48 @@ import { join, resolve } from 'node:path'
 const test = baseTest.if(process.platform !== 'win32')
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
+
+// Canonical self-destruct logic for the T4 stand-in processes (issue #69).
+// Both the cc-stub (Claude Code grandparent) and inner-stub (bun wrapper
+// parent) `await import` this so they self-terminate if the test runner dies.
+const SELF_DESTRUCT_STUB = join(REPO_ROOT, 'tests', 'helpers', 'self-destruct-stub.ts')
+
+// Hard maximum lifetime for any T4 stand-in process. The guardian-liveness
+// poll (watching the test-runner pid) is the primary cleanup; this TTL is the
+// belt-and-suspenders safety valve so an orphan can never outlive it even if
+// every other mechanism fails. Comfortably larger than T4's 45s test timeout
+// so it never fires during a normal, uninterrupted run.
+const STUB_TTL_MS = 120_000
+
+// Best-effort sweep of stale lifecycle temp dirs left by prior *interrupted*
+// runs (issue #69, AC6). A normal run rmSync's its own dir; an interrupted run
+// leaks `tgrelay-t{4,5,6}-*` dirs in tmpdir. Only remove dirs older than this
+// threshold so we never clobber a concurrently-running test's live dir.
+const STALE_TMP_AGE_MS = 60 * 60 * 1000 // 1 hour
+
+function sweepStaleTempDirs() {
+  let entries: string[]
+  try {
+    entries = readdirSync(tmpdir())
+  } catch {
+    return
+  }
+  const now = Date.now()
+  for (const name of entries) {
+    if (!/^tgrelay-t\d+-/.test(name)) continue
+    const full = join(tmpdir(), name)
+    try {
+      if (now - statSync(full).mtimeMs < STALE_TMP_AGE_MS) continue
+      rmSync(full, { recursive: true, force: true })
+    } catch {
+      /* gone already, or not ours to remove — ignore */
+    }
+  }
+}
+
+beforeAll(() => {
+  sweepStaleTempDirs()
+})
 
 // Track every spawned subprocess so afterEach can reliably tear them down.
 const tracked: Array<{ proc: any; label: string }> = []
@@ -193,11 +243,13 @@ test('T4: plugin exits within 30s after grandparent (Claude Code stub) dies', as
   // own pid, so the test can reap it) then stays alive — deliberately, so the
   // plugin's *parent* outlives the *grandparent* this test kills.
   //
-  // Stay alive with a long no-op timer rather than `await new Promise(() => {})`.
-  // The promise form, combined with a `pipe` stdin, makes bun busy-poll the
-  // dead stdin fd once the grandparent closes the pipe — pegging a CPU core
-  // forever (issue #58). A timer keeps the event loop alive without spinning,
-  // and `stdin: 'ignore'` removes the pipe entirely.
+  // Staying alive is delegated to the self-destruct helper (issue #69): it
+  // installs a guardian-liveness poll on the *test runner* pid plus a hard TTL
+  // valve, so this stub can outlive its own parent (the cc-stub, which T4 kills
+  // on purpose) yet still self-terminate the moment `bun test` itself dies. The
+  // helper inherits TGRELAY_STUB_WATCH_PID / TGRELAY_STUB_TTL_MS from the env
+  // we set on the cc-stub below. `stdin: 'ignore'` removes the pipe entirely so
+  // there is no dead fd to busy-poll (the original #58 spin source).
   writeFileSync(
     innerStubScript,
     `
@@ -210,15 +262,16 @@ const proc = Bun.spawn(['bun', 'src/plugin.ts'], {
 })
 writeFileSync(${JSON.stringify(pidFile)}, String(proc.pid))
 writeFileSync(${JSON.stringify(innerPidFile)}, String(process.pid))
-setInterval(() => {}, 1 << 30)
+await import(${JSON.stringify(SELF_DESTRUCT_STUB)})
 `,
   )
 
   // Outer stub: this is the "Claude Code" grandparent. It spawns the inner
   // stub (stdin ignored so the inner stub can't busy-spin on a broken pipe
-  // when this process dies) and stays alive via a no-op timer. When the test
-  // kills *this* process, the plugin's grandparent dies and the plugin must
-  // shut itself down within 30s.
+  // when this process dies) and stays alive via the same self-destruct helper.
+  // When the test kills *this* process, the plugin's grandparent dies and the
+  // plugin must shut itself down within 30s. When the whole test runner dies,
+  // the helper's guardian poll terminates this stub too.
   writeFileSync(
     ccStubScript,
     `
@@ -228,7 +281,7 @@ Bun.spawn(['bun', ${JSON.stringify(innerStubScript)}], {
   stdout: 'ignore',
   stderr: 'ignore',
 })
-setInterval(() => {}, 1 << 30)
+await import(${JSON.stringify(SELF_DESTRUCT_STUB)})
 `,
   )
 
@@ -238,7 +291,14 @@ setInterval(() => {}, 1 << 30)
       stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: process.env,
+      // Guardian = this test-runner process. Both stubs (cc-stub here and the
+      // inner-stub it spawns, which inherits this env) watch it and self-destruct
+      // if `bun test` dies before afterEach can reap them (issue #69).
+      env: {
+        ...process.env,
+        TGRELAY_STUB_WATCH_PID: String(process.pid),
+        TGRELAY_STUB_TTL_MS: String(STUB_TTL_MS),
+      },
     }),
     'cc-stub-t4',
   )
@@ -491,3 +551,318 @@ test('T6: a plugin with a living parent is not reaped (regression for #29)', asy
   // And we should NOT see this PID listed in any reaped-orphan log line.
   expect(logContents).not.toMatch(new RegExp(`reaped orphan plugin pid=${pluginPid}`))
 }, 30_000)
+
+// ── T7: self-destruct-stub guardian death + TTL valve (issue #69) ──────────
+//
+// Directly exercises the self-destruct helper's two termination triggers:
+//   (a) guardian-liveness poll  — exits promptly once the watched pid dies
+//   (b) TTL safety valve        — exits after TGRELAY_STUB_TTL_MS regardless
+//
+// Both are tested as black boxes by running `bun ${SELF_DESTRUCT_STUB}` with
+// the documented env vars and a pid file to discover the stub's own pid.
+
+test('T7: self-destruct stub exits on guardian death and honors TTL valve', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'tgrelay-t7-'))
+
+  // ── Part 1: guardian death ──────────────────────────────────────────────
+  // A throwaway guardian we fully control. The stub watches it with a LONG TTL
+  // so the only thing that can kill the stub within the window is the guardian
+  // dying — proving the guardian-liveness poll, not the TTL, is what fires.
+  const guardian = track(
+    Bun.spawn(['sleep', '120'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }),
+    'guardian-t7',
+  )
+
+  const guardPidFile = join(tmp, 'guard-stub.pid')
+  const guardStub = track(
+    Bun.spawn(['bun', SELF_DESTRUCT_STUB], {
+      cwd: REPO_ROOT,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        TGRELAY_STUB_WATCH_PID: String(guardian.pid),
+        TGRELAY_STUB_PID_FILE: guardPidFile,
+        TGRELAY_STUB_TTL_MS: '120000', // long — TTL cannot be the cause of exit
+      },
+    }),
+    'guard-stub-t7',
+  )
+
+  // Discover the stub's own pid from the pid file it writes on boot.
+  let guardStubPid: number | undefined
+  for (let i = 0; i < 50; i++) {
+    if (existsSync(guardPidFile)) {
+      const v = parseInt(readFileSync(guardPidFile, 'utf8').trim(), 10)
+      if (Number.isFinite(v) && v > 0) {
+        guardStubPid = v
+        break
+      }
+    }
+    await sleep(200)
+  }
+  expect(guardStubPid).toBeDefined()
+  if (!guardStubPid) throw new Error('did not get guard-stub pid')
+  trackedPids.push(guardStubPid)
+
+  // Stub should be alive while its guardian lives.
+  expect(await pidAlive(guardStubPid)).toBe(true)
+
+  // Kill the guardian; the stub must notice via its ~1s poll and exit.
+  guardian.kill('SIGKILL')
+  await waitForExit(guardian, 3000)
+
+  const guardDeadline = Date.now() + 5000
+  let guardStubExited = false
+  while (Date.now() < guardDeadline) {
+    if (!(await pidAlive(guardStubPid))) {
+      guardStubExited = true
+      break
+    }
+    await sleep(200)
+  }
+  if (!guardStubExited) {
+    try { process.kill(guardStubPid, 9) } catch {}
+  }
+  expect(guardStubExited).toBe(true)
+
+  // ── Part 2: TTL valve ───────────────────────────────────────────────────
+  // No guardian (poll disabled) and a SHORT TTL — the only thing that can kill
+  // the stub is the TTL safety valve.
+  const ttlPidFile = join(tmp, 'ttl-stub.pid')
+  const ttlStub = track(
+    Bun.spawn(['bun', SELF_DESTRUCT_STUB], {
+      cwd: REPO_ROOT,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        // Deliberately no TGRELAY_STUB_WATCH_PID — guardian poll disabled.
+        TGRELAY_STUB_PID_FILE: ttlPidFile,
+        TGRELAY_STUB_TTL_MS: '1500',
+      },
+    }),
+    'ttl-stub-t7',
+  )
+
+  let ttlStubPid: number | undefined
+  for (let i = 0; i < 50; i++) {
+    if (existsSync(ttlPidFile)) {
+      const v = parseInt(readFileSync(ttlPidFile, 'utf8').trim(), 10)
+      if (Number.isFinite(v) && v > 0) {
+        ttlStubPid = v
+        break
+      }
+    }
+    await sleep(100)
+  }
+  expect(ttlStubPid).toBeDefined()
+  if (!ttlStubPid) throw new Error('did not get ttl-stub pid')
+  trackedPids.push(ttlStubPid)
+
+  // Within ~5s (TTL is 1.5s) the stub must self-terminate purely from the TTL.
+  const ttlDeadline = Date.now() + 5000
+  let ttlStubExited = false
+  while (Date.now() < ttlDeadline) {
+    if (!(await pidAlive(ttlStubPid))) {
+      ttlStubExited = true
+      break
+    }
+    await sleep(200)
+  }
+  if (!ttlStubExited) {
+    try { process.kill(ttlStubPid, 9) } catch {}
+  }
+  expect(ttlStubExited).toBe(true)
+
+  try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+}, 30_000)
+
+// ── T8: harness interruption leaves zero surviving helpers (issue #69) ─────
+//
+// Simulates `bun test` being SIGKILLed mid-T4. A nested "fake harness" bun
+// script reproduces the T4 process tree (cc-stub -> inner-stub -> plugin),
+// with the stubs watching the FAKE HARNESS as their guardian. When we kill the
+// fake harness, the whole helper tree must die on its own: the two stubs via
+// the ~1s guardian poll, the plugin via its independent parent-death watchdog
+// (up to ~30s). Nothing should survive — that is the AC1/AC2 contract.
+
+test('T8: killing the harness reaps the entire helper tree (no orphans)', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'tgrelay-t8-'))
+  const ccPidFile = join(tmp, 'cc.pid')
+  const innerPidFile = join(tmp, 'inner.pid')
+  const pluginPidFile = join(tmp, 'plugin.pid')
+  const ccStubScript = join(tmp, 'cc-stub.ts')
+  const innerStubScript = join(tmp, 'inner-stub.ts')
+  const harnessScript = join(tmp, 'fake-harness.ts')
+
+  // Inner stub: direct parent of the plugin. Writes the plugin pid and its own
+  // pid, then stays alive via the self-destruct helper (which inherits the
+  // guardian/TTL env from the cc-stub that spawns it).
+  writeFileSync(
+    innerStubScript,
+    `
+import { writeFileSync } from 'node:fs'
+const proc = Bun.spawn(['bun', 'src/plugin.ts'], {
+  cwd: ${JSON.stringify(REPO_ROOT)},
+  stdin: 'pipe',
+  stdout: 'ignore',
+  stderr: 'ignore',
+})
+writeFileSync(${JSON.stringify(pluginPidFile)}, String(proc.pid))
+writeFileSync(${JSON.stringify(innerPidFile)}, String(process.pid))
+await import(${JSON.stringify(SELF_DESTRUCT_STUB)})
+`,
+  )
+
+  // cc-stub: the "Claude Code" grandparent. Spawns the inner stub (which
+  // inherits the guardian/TTL env), writes its own pid, and stays alive via the
+  // self-destruct helper.
+  writeFileSync(
+    ccStubScript,
+    `
+import { writeFileSync } from 'node:fs'
+Bun.spawn(['bun', ${JSON.stringify(innerStubScript)}], {
+  cwd: ${JSON.stringify(REPO_ROOT)},
+  stdin: 'ignore',
+  stdout: 'ignore',
+  stderr: 'ignore',
+})
+writeFileSync(${JSON.stringify(ccPidFile)}, String(process.pid))
+await import(${JSON.stringify(SELF_DESTRUCT_STUB)})
+`,
+  )
+
+  // Fake harness: stands in for the `bun test` process. It spawns the cc-stub
+  // with TGRELAY_STUB_WATCH_PID set to ITS OWN pid, so the whole stub tree
+  // watches the harness as guardian. Then it stays alive (long TTL) until we
+  // kill it — mimicking a test run interrupted mid-T4.
+  writeFileSync(
+    harnessScript,
+    `
+Bun.spawn(['bun', ${JSON.stringify(ccStubScript)}], {
+  cwd: ${JSON.stringify(REPO_ROOT)},
+  stdin: 'ignore',
+  stdout: 'ignore',
+  stderr: 'ignore',
+  env: {
+    ...process.env,
+    TGRELAY_STUB_WATCH_PID: String(process.pid),
+    TGRELAY_STUB_TTL_MS: String(${STUB_TTL_MS}),
+  },
+})
+// Stay alive until SIGKILLed by the test. Use the helper too so this process
+// itself can never outlive the real test runner.
+await import(${JSON.stringify(SELF_DESTRUCT_STUB)})
+`,
+  )
+
+  const harness = track(
+    Bun.spawn(['bun', harnessScript], {
+      cwd: REPO_ROOT,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      // The fake harness itself watches THIS real test runner as its guardian,
+      // so even the harness can't leak if `bun test` is killed.
+      env: {
+        ...process.env,
+        TGRELAY_STUB_WATCH_PID: String(process.pid),
+        TGRELAY_STUB_TTL_MS: String(STUB_TTL_MS),
+      },
+    }),
+    'fake-harness-t8',
+  )
+
+  // Helper to read a pid file defensively (may be empty/partial momentarily).
+  const readPid = (file: string): number | undefined => {
+    try {
+      const v = parseInt(readFileSync(file, 'utf8').trim(), 10)
+      return Number.isFinite(v) && v > 0 ? v : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  // Wait until all three pid files exist with valid, alive pids.
+  let ccPid: number | undefined
+  let innerPid: number | undefined
+  let pluginPid: number | undefined
+  for (let i = 0; i < 100; i++) {
+    ccPid = readPid(ccPidFile)
+    innerPid = readPid(innerPidFile)
+    pluginPid = readPid(pluginPidFile)
+    if (
+      ccPid && innerPid && pluginPid &&
+      (await pidAlive(ccPid)) &&
+      (await pidAlive(innerPid)) &&
+      (await pidAlive(pluginPid))
+    ) {
+      break
+    }
+    await sleep(200)
+  }
+
+  expect(ccPid).toBeDefined()
+  expect(innerPid).toBeDefined()
+  expect(pluginPid).toBeDefined()
+  if (!ccPid || !innerPid || !pluginPid) {
+    // Ensure nothing leaks before bailing.
+    for (const p of [ccPid, innerPid, pluginPid]) {
+      if (p) try { process.kill(p, 9) } catch {}
+    }
+    try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+    throw new Error('did not get all three helper pids')
+  }
+
+  // Register every helper pid for guaranteed teardown (no Bun.spawn handles for
+  // the nested children).
+  trackedPids.push(ccPid, innerPid, pluginPid)
+
+  // All three must be alive before we pull the rug out.
+  expect(await pidAlive(ccPid)).toBe(true)
+  expect(await pidAlive(innerPid)).toBe(true)
+  expect(await pidAlive(pluginPid)).toBe(true)
+
+  // Interrupt the "harness" — the moment that simulates a killed `bun test`.
+  harness.kill('SIGKILL')
+  await waitForExit(harness, 3000)
+
+  // The two stubs die within ~1-2s (guardian poll); the plugin's independent
+  // parent-death watchdog can take up to ~30s. Allow a 35s deadline, then
+  // record which (if any) survived before force-killing so the test never
+  // leaks. The honest assertion is: the survivor set was empty.
+  const deadline = Date.now() + 35_000
+  const targets = [
+    { label: 'cc-stub', pid: ccPid },
+    { label: 'inner-stub', pid: innerPid },
+    { label: 'plugin', pid: pluginPid },
+  ]
+  const survivors: string[] = []
+  while (Date.now() < deadline) {
+    let allDead = true
+    for (const t of targets) {
+      if (await pidAlive(t.pid)) {
+        allDead = false
+        break
+      }
+    }
+    if (allDead) break
+    await sleep(500)
+  }
+
+  // Snapshot survivors at the deadline, then force-kill any so afterEach is clean.
+  for (const t of targets) {
+    if (await pidAlive(t.pid)) {
+      survivors.push(`${t.label} (pid=${t.pid})`)
+      try { process.kill(t.pid, 9) } catch {}
+    }
+  }
+
+  try { rmSync(tmp, { recursive: true, force: true }) } catch {}
+
+  // The contract: every helper self-terminated after the harness died.
+  expect(survivors).toEqual([])
+}, 60_000)
