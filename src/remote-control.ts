@@ -210,26 +210,141 @@ export function _resetZellijCache(): void {
   zellijPathCache = undefined
 }
 
-export type InjectResult = { ok: true } | { ok: false; error: string }
+// ── pane resolution ─────────────────────────────────────────────────────────
+//
+// A zellij tab usually has multiple panes (Claude + shells). `write-chars`
+// targets whichever pane is *focused*, which isn't guaranteed to be Claude — so
+// we must find the exact Claude pane and focus it by id first. `list-panes
+// --all` reports every pane with its tab, command, cwd and focus state; the
+// Claude pane is the terminal whose command is the `claude` binary.
+
+export type PaneInfo = {
+  tabName: string
+  paneId: string // e.g. "terminal_3"
+  type: string // "terminal" | "plugin"
+  title: string // pane display name (user-renamable, e.g. "Claude Code")
+  command: string
+  cwd: string
+  focused: boolean
+}
+
+/** Pane title that explicitly marks the Claude pane to target (user-renamable). */
+export const DEFAULT_PANE_NAME = 'Claude Code'
 
 /**
- * Focus the target tab and type `commandLine` followed by Enter. Each zellij
- * action is a separate, blocking invocation; any failure (session/tab missing,
- * binary not found) returns `{ ok: false }` rather than throwing.
+ * Parse `zellij action list-panes --all` table output. Columns are separated by
+ * runs of 2+ spaces (values use single spaces internally). The header is used
+ * to locate columns; PANE_ID has a regex fallback so a stray double-space in a
+ * free-form TITLE can't drop a row entirely.
+ */
+export function parseListPanes(output: string): PaneInfo[] {
+  const lines = output.split('\n').map((l) => l.replace(/\s+$/, '')).filter((l) => l.length > 0)
+  const headerIdx = lines.findIndex((l) => /\bPANE_ID\b/.test(l) && /\bTAB_NAME\b/.test(l))
+  if (headerIdx === -1) return []
+  const header = lines[headerIdx]!.split(/ {2,}/)
+  const idx = (name: string) => header.indexOf(name)
+  const iTab = idx('TAB_NAME')
+  const iPane = idx('PANE_ID')
+  const iType = idx('TYPE')
+  const iTitle = idx('TITLE')
+  const iCmd = idx('COMMAND')
+  const iCwd = idx('CWD')
+  const iFoc = idx('FOCUSED')
+
+  const panes: PaneInfo[] = []
+  for (const line of lines.slice(headerIdx + 1)) {
+    const parts = line.split(/ {2,}/)
+    const paneId = (iPane >= 0 ? parts[iPane] : undefined) ?? line.match(/\b(?:terminal|plugin)_\d+\b/)?.[0]
+    if (!paneId) continue
+    panes.push({
+      tabName: (iTab >= 0 ? parts[iTab] : '') ?? '',
+      paneId,
+      type: (iType >= 0 ? parts[iType] : '') ?? '',
+      title: (iTitle >= 0 ? parts[iTitle] : '') ?? '',
+      command: (iCmd >= 0 ? parts[iCmd] : '') ?? '',
+      cwd: (iCwd >= 0 ? parts[iCwd] : '') ?? '',
+      focused: ((iFoc >= 0 ? parts[iFoc] : '') ?? '').toLowerCase() === 'true',
+    })
+  }
+  return panes
+}
+
+/** True when a pane's command is the `claude` binary (any path / args). */
+function isClaudeCommand(command: string): boolean {
+  const first = command.trim().split(/\s+/)[0] ?? ''
+  const base = first.split('/').pop() ?? first
+  return base === 'claude'
+}
+
+export type PaneResolution = { ok: true; paneId: string } | { ok: false; error: string }
+
+/**
+ * Find the Claude pane to type into: the terminal pane in `tab` whose command
+ * is `claude`. Fails (rather than guessing) when the tab is missing or has no
+ * Claude pane — we never type into a pane we can't confirm is Claude.
+ *
+ * When a tab holds several Claude panes, disambiguate by, in order: a pane
+ * explicitly named `paneName` (default "Claude Code" — rename the pane in
+ * zellij to pin it), then the focused one, then the first.
+ */
+export function resolveTargetPane(
+  panes: PaneInfo[],
+  opts: { tab: string; paneName?: string },
+): PaneResolution {
+  const paneName = opts.paneName ?? DEFAULT_PANE_NAME
+  const inTab = panes.filter((p) => p.tabName === opts.tab && p.type === 'terminal')
+  if (inTab.length === 0) return { ok: false, error: `no terminal panes found in zellij tab "${opts.tab}"` }
+  const claude = inTab.filter((p) => isClaudeCommand(p.command))
+  if (claude.length === 0) return { ok: false, error: `no Claude pane found in zellij tab "${opts.tab}"` }
+  if (claude.length === 1) return { ok: true, paneId: claude[0]!.paneId }
+  // Ambiguous: prefer an explicitly-named pane, then the focused one, then first.
+  const named = claude.find((p) => p.title === paneName)
+  const focused = claude.find((p) => p.focused)
+  return { ok: true, paneId: (named ?? focused ?? claude[0]!).paneId }
+}
+
+// ── injection (side-effecting) ──────────────────────────────────────────────
+
+export type InjectResult = { ok: true } | { ok: false; error: string }
+
+function zellijError(err: unknown, what: string): string {
+  const e = err as Error & { stderr?: Buffer }
+  const stderr = e.stderr ? e.stderr.toString().trim() : ''
+  return stderr || e.message || `zellij ${what} failed`
+}
+
+/**
+ * Find the Claude pane in `tab`, focus it by id, then type `commandLine` + Enter.
+ * Every step is a blocking zellij invocation; any failure (binary missing,
+ * session/tab gone, no resolvable Claude pane) returns `{ ok: false }` rather
+ * than throwing — and crucially, we never type into a pane we couldn't confirm
+ * is Claude.
  */
 export function injectCommand(opts: { session: string; tab: string; commandLine: string }): InjectResult {
   const zellij = resolveZellij()
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
   const base = ['--session', opts.session, 'action']
+
+  let panesOut: string
   try {
-    execFileSync(zellij, [...base, 'go-to-tab-name', opts.tab], { stdio: ['ignore', 'pipe', 'pipe'] })
+    panesOut = execFileSync(zellij, [...base, 'list-panes', '--all'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (err) {
+    return { ok: false, error: zellijError(err, 'list-panes') }
+  }
+
+  const resolved = resolveTargetPane(parseListPanes(panesOut), { tab: opts.tab })
+  if (!resolved.ok) return { ok: false, error: resolved.error }
+
+  try {
+    execFileSync(zellij, [...base, 'focus-pane-id', resolved.paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
     execFileSync(zellij, [...base, 'write-chars', opts.commandLine], { stdio: ['ignore', 'pipe', 'pipe'] })
     // 13 = carriage return (Enter) to submit the command.
     execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
     return { ok: true }
   } catch (err) {
-    const e = err as Error & { stderr?: Buffer }
-    const stderr = e.stderr ? e.stderr.toString().trim() : ''
-    return { ok: false, error: stderr || e.message || 'zellij invocation failed' }
+    return { ok: false, error: zellijError(err, 'inject') }
   }
 }

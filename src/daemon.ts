@@ -776,7 +776,10 @@ function setupInboundHandlers(state: ChannelState): void {
     // channel via access.json → remoteControl. Unknown slash commands (skills
     // like /code-review) parse as 'not-command' and fall through to the model.
     const rc = access.remoteControl
-    if (rc?.enabled && rc.zellijSession && rc.zellijTab) {
+    if (rc?.enabled && rc.zellijSession) {
+      // Tab defaults to the channel name — the user's tabs are named per
+      // project/channel (e.g. the "tg-relay" tab for the tg-relay channel).
+      const tab = rc.zellijTab || channelName
       const parsed = parseControlCommand(text, rc.commands)
       if (parsed.kind === 'error') {
         await bot.api.sendMessage(chat_id, parsed.message).catch(() => {})
@@ -785,7 +788,7 @@ function setupInboundHandlers(state: ChannelState): void {
       if (parsed.kind === 'inject') {
         const res = injectCommand({
           session: rc.zellijSession,
-          tab: rc.zellijTab,
+          tab,
           commandLine: parsed.keystrokes,
         })
         if (res.ok) {
@@ -794,7 +797,7 @@ function setupInboundHandlers(state: ChannelState): void {
               { type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] },
             ]).catch(() => {})
           }
-          log(channelName, `remote-control: injected '${parsed.command}' into ${rc.zellijSession}:${rc.zellijTab}`)
+          log(channelName, `remote-control: injected '${parsed.command}' into ${rc.zellijSession}:${tab}`)
         } else {
           await bot.api.sendMessage(chat_id, `⚠️ couldn't run ${parsed.command}: ${res.error}`).catch(() => {})
           log(channelName, `remote-control: inject failed for '${parsed.command}': ${res.error}`)

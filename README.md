@@ -235,7 +235,7 @@ For heartbeats that must survive session closes, keep the session alive in tmux 
 
 Built-in Claude Code slash commands (`/clear`, `/compact`, `/model`, …) are pure terminal-client state — they have no MCP/tool/hook surface, so a relayed session normally can't trigger them. With remote control enabled, the daemon recognizes a small allowlist of these commands sent over Telegram and **injects them as keystrokes into the session's zellij pane**, letting you clear/compact context or switch models from your phone.
 
-This requires your Claude Code session to run inside a **named zellij tab** (the daemon, running headless under launchd, addresses the session by name and focuses the tab before typing). Opt in per channel by adding a `remoteControl` block to `~/.claude/channels/telegram-<name>/access.json`:
+This requires your Claude Code session to run inside a **named zellij tab** (the daemon, running headless under launchd, addresses the session by name). Opt in per channel by adding a `remoteControl` block to `~/.claude/channels/telegram-<name>/access.json`:
 
 ```jsonc
 {
@@ -244,11 +244,13 @@ This requires your Claude Code session to run inside a **named zellij tab** (the
   "remoteControl": {
     "enabled": true,
     "zellijSession": "main",     // `zellij list-sessions`
-    "zellijTab": "tg-relay",     // the tab your Claude session runs in
+    "zellijTab": "tg-relay",     // optional; defaults to the channel name
     "commands": ["clear", "compact", "model"]  // optional: narrow the allowlist
   }
 }
 ```
+
+**Pane targeting.** A tab usually holds several panes (Claude plus shells/editors), and the focused one is often *not* Claude — so the daemon doesn't blindly type into the focused pane. It runs `zellij action list-panes --all`, finds the terminal pane in the tab whose command is the `claude` binary, and focuses *that* pane by id before typing. If it can't resolve exactly one Claude pane, it **replies with an error instead of typing into the wrong pane**. If a tab ever has two Claude sessions, rename the one you want to drive to **`Claude Code`** in zellij (the daemon prefers a Claude pane with that title) — for a single Claude pane per tab, no renaming is needed.
 
 Supported commands (one-shot only): `/clear`, `/compact [hint]`, `/model <alias>`, `/fast`, `/cost`, `/context`, `/status`. `/model` takes a validated alias (`opus`, `sonnet`, `haiku`, `opusplan`, `default`, `fast`, or a `claude-*` id) and is injected directly — no picker to navigate. On success the daemon reacts ✅ to your message; invalid input gets a short reply.
 
@@ -258,7 +260,7 @@ Security model:
 - Off by default; only senders who already pass the channel's access gate are honored. Unknown slash commands (e.g. skills like `/code-review`) are **not** intercepted — they reach the model as usual.
 
 Caveats:
-- **Focus steal** — focusing the target tab switches your *visible* zellij tab. Irrelevant when you're away (the point), mildly annoying if you're at the desk in another tab. Prior focus is not restored.
+- **Focus steal** — focusing the target pane switches your *visible* zellij tab (and the focused pane within it). Irrelevant when you're away (the point), mildly annoying if you're at the desk elsewhere. Prior focus is not restored.
 - **Best when idle** — if the target session is mid-response when the command lands, the keystrokes may queue. Send control commands when the session is waiting on you.
 - Override the zellij binary path with `TG_RELAY_ZELLIJ` if it's not on the daemon's minimal launchd `PATH`.
 

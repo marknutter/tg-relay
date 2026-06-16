@@ -14,9 +14,16 @@
  *   args are strictly validated, and the resulting keystrokes can NEVER
  *   contain a newline / control char.
  *
+ *   parseListPanes(output) — pure. Parses the table printed by
+ *   `zellij action list-panes --all` into PaneInfo[].
+ *
+ *   resolveTargetPane(panes, { tab }) — pure. Finds the unique Claude pane
+ *   in the target tab to focus before typing.
+ *
  *   injectCommand({ session, tab, commandLine }) — side-effecting. Runs
- *   zellij three times (go-to-tab-name, write-chars, write 13) to type the
- *   command into a pane. Tested with a stub zellij binary forced via the
+ *   zellij four times: it reads `list-panes --all` stdout to resolve the
+ *   Claude pane, then focus-pane-id <id>, write-chars <commandLine>,
+ *   write 13. Tested with a stub zellij binary forced via the
  *   TG_RELAY_ZELLIJ env var; the resolved path is cached so we call
  *   _resetZellijCache() before each env change.
  */
@@ -35,7 +42,11 @@ import {
 import {
   parseControlCommand,
   injectCommand,
+  parseListPanes,
+  resolveTargetPane,
+  type PaneInfo,
   SUPPORTED_COMMANDS,
+  DEFAULT_PANE_NAME,
   _resetZellijCache,
 } from '../src/remote-control.ts'
 
@@ -370,7 +381,296 @@ describe('parseControlCommand — allowed narrowing', () => {
   })
 })
 
-// ─── injectCommand — zellij stub plumbing ────────────────────────────────
+// ─── parseListPanes — pure table parsing ─────────────────────────────────
+
+// A realistic `zellij action list-panes --all` table. Columns separated by
+// runs of 2+ spaces; values within a column use single spaces.
+const SAMPLE_TABLE = [
+  'TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS',
+  '0  0  Maddiebot  terminal_0  terminal  ✳ Send marketing messages  claude --dangerously-skip-permissions --resume eea9b076  /Users/marknutter/Code/maddiebot  true  false  false  0  1  43  75',
+  '0  0  Maddiebot  terminal_1  terminal  Pane #2  /bin/zsh  /Users/marknutter/Code/geology  false  false  false  75  1  43  83',
+  '5  3  tg-relay  terminal_44  terminal  Work on issue  claude --resume deadbeef  /Users/marknutter/Code/tg-relay  false  false  false  0  1  43  75',
+  '5  3  tg-relay  terminal_45  terminal  Pane #2  /bin/zsh  /Users/marknutter/Code/tg-relay  false  false  false  0  1  43  75',
+].join('\n')
+
+describe('parseListPanes', () => {
+  test('parses one PaneInfo per data row, mapping the right columns', () => {
+    const panes = parseListPanes(SAMPLE_TABLE)
+    expect(panes.length).toBe(4)
+
+    expect(panes[0]).toMatchObject({
+      tabName: 'Maddiebot',
+      paneId: 'terminal_0',
+      type: 'terminal',
+      command: 'claude --dangerously-skip-permissions --resume eea9b076',
+      cwd: '/Users/marknutter/Code/maddiebot',
+      focused: true,
+    })
+
+    expect(panes[1]).toMatchObject({
+      tabName: 'Maddiebot',
+      paneId: 'terminal_1',
+      type: 'terminal',
+      command: '/bin/zsh',
+      cwd: '/Users/marknutter/Code/geology',
+      focused: false,
+    })
+
+    expect(panes[2]).toMatchObject({
+      tabName: 'tg-relay',
+      paneId: 'terminal_44',
+      type: 'terminal',
+      command: 'claude --resume deadbeef',
+      cwd: '/Users/marknutter/Code/tg-relay',
+      focused: false,
+    })
+
+    expect(panes[3]).toMatchObject({
+      tabName: 'tg-relay',
+      paneId: 'terminal_45',
+      command: '/bin/zsh',
+      focused: false,
+    })
+  })
+
+  test('focused is true only when the FOCUSED column is the string "true"', () => {
+    const panes = parseListPanes(SAMPLE_TABLE)
+    expect(panes.filter((p) => p.focused).length).toBe(1)
+    expect(panes[0].focused).toBe(true)
+    for (const p of panes.slice(1)) {
+      expect(p.focused).toBe(false)
+    }
+  })
+
+  test('a COMMAND with single spaces is captured whole in .command', () => {
+    const panes = parseListPanes(SAMPLE_TABLE)
+    expect(panes[0].command).toBe(
+      'claude --dangerously-skip-permissions --resume eea9b076',
+    )
+  })
+
+  test('empty string → []', () => {
+    expect(parseListPanes('')).toEqual([])
+  })
+
+  test('junk with no recognizable header → []', () => {
+    expect(parseListPanes('this is not a pane table\nat all')).toEqual([])
+  })
+
+  test('lines before the header are ignored; the header itself is not a pane', () => {
+    const withPreamble = [
+      'Some startup noise from zellij',
+      'another preamble line',
+      SAMPLE_TABLE,
+    ].join('\n')
+    const panes = parseListPanes(withPreamble)
+    expect(panes.length).toBe(4)
+    // Header is never returned as a pane.
+    for (const p of panes) {
+      expect(p.paneId).not.toBe('PANE_ID')
+      expect(p.tabName).not.toBe('TAB_NAME')
+    }
+  })
+
+  test('populates .title from the TITLE column without confusing it with .command', () => {
+    const table = [
+      'TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS',
+      '0  0  tg-relay  terminal_44  terminal  Claude Code  claude --resume abc  /Users/x/tg-relay  true  false  false  0  1  43  75',
+      '0  0  tg-relay  terminal_45  terminal  Pane #2  /bin/zsh  /Users/x/tg-relay  false  false  false  0  1  43  75',
+    ].join('\n')
+    const panes = parseListPanes(table)
+    expect(panes.length).toBe(2)
+
+    expect(panes[0].title).toBe('Claude Code')
+    expect(panes[0].command).toBe('claude --resume abc')
+
+    // The shell row keeps its own title, not the Claude one.
+    expect(panes[1].title).toBe('Pane #2')
+    expect(panes[1].command).toBe('/bin/zsh')
+  })
+})
+
+// ─── resolveTargetPane — pure Claude-pane selection ──────────────────────
+
+function pane(overrides: Partial<PaneInfo>): PaneInfo {
+  return {
+    tabName: 'tg-relay',
+    paneId: 'terminal_1',
+    type: 'terminal',
+    title: 'Pane',
+    command: '/bin/zsh',
+    cwd: '/Users/marknutter/Code/tg-relay',
+    focused: false,
+    ...overrides,
+  }
+}
+
+describe('resolveTargetPane', () => {
+  test('exactly one Claude pane in the tab → { ok: true, paneId }', () => {
+    const panes = [
+      pane({ paneId: 'terminal_44', command: 'claude --resume deadbeef' }),
+      pane({ paneId: 'terminal_45', command: '/bin/zsh' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_44')
+  })
+
+  test('recognizes an absolute-path claude binary as the Claude pane', () => {
+    const panes = [
+      pane({
+        paneId: 'terminal_9',
+        command: '/Users/marknutter/.bun/bin/claude --resume abc',
+      }),
+      pane({ paneId: 'terminal_10', command: '/bin/zsh' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_9')
+  })
+
+  test('zero terminal panes in the tab → { ok: false } mentioning the tab', () => {
+    const panes = [
+      pane({ tabName: 'other-tab', command: 'claude --resume x' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain('tg-relay')
+  })
+
+  test('terminal panes exist but none are Claude → { ok: false }', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', command: '/bin/zsh' }),
+      pane({ paneId: 'terminal_2', command: '/usr/bin/vim foo.txt' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(typeof r.error).toBe('string')
+  })
+
+  test('non-terminal panes are ignored even if their command is claude', () => {
+    const panes = [
+      pane({ paneId: 'plugin_1', type: 'plugin', command: 'claude --resume x' }),
+      pane({ paneId: 'terminal_1', command: '/bin/zsh' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(false)
+  })
+
+  test('multiple Claude panes → picks the focused one if present', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', command: 'claude --resume b', focused: true }),
+      pane({ paneId: 'terminal_3', command: 'claude --resume c', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+
+  test('multiple Claude panes, none focused → picks the first', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', command: 'claude --resume b', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_1')
+  })
+
+  test('a Claude pane in a DIFFERENT tab is ignored', () => {
+    const panes = [
+      pane({
+        tabName: 'other-tab',
+        paneId: 'terminal_99',
+        command: 'claude --resume elsewhere',
+      }),
+      pane({ tabName: 'tg-relay', paneId: 'terminal_1', command: '/bin/zsh' }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    // Only the wrong-tab pane is Claude; the target tab has no Claude pane.
+    expect(r.ok).toBe(false)
+  })
+
+  // ─── disambiguation among MULTIPLE Claude panes (title tiebreak) ────────
+
+  test('two Claude panes, one titled "Claude Code" (not first, none focused) → name wins over position', () => {
+    const panes = [
+      // The non-named one is FIRST, to prove name beats position.
+      pane({ paneId: 'terminal_1', title: 'Some other title', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', title: DEFAULT_PANE_NAME, command: 'claude --resume b', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+
+  test('two Claude panes, the OTHER one focused but one titled "Claude Code" → name beats focus', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', title: 'Claude Code', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', title: 'Not it', command: 'claude --resume b', focused: true }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_1')
+  })
+
+  test('two Claude panes, neither named "Claude Code", one focused → picks the focused one', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', title: 'Pane A', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', title: 'Pane B', command: 'claude --resume b', focused: true }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+
+  test('two Claude panes, neither named nor focused → picks the first', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', title: 'Pane A', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', title: 'Pane B', command: 'claude --resume b', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_1')
+  })
+
+  test('paneName override picks the pane with that title', () => {
+    const panes = [
+      pane({ paneId: 'terminal_1', title: 'Claude Code', command: 'claude --resume a', focused: false }),
+      pane({ paneId: 'terminal_2', title: 'My Claude', command: 'claude --resume b', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay', paneName: 'My Claude' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+
+  test('a shell mis-titled "Claude Code" is never selected; the real Claude pane wins', () => {
+    const panes = [
+      // A shell wearing the "Claude Code" title — NOT a claude command.
+      pane({ paneId: 'terminal_1', title: 'Claude Code', command: '/bin/zsh', focused: false }),
+      pane({ paneId: 'terminal_2', title: 'Pane #2', command: 'claude --resume real', focused: false }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+
+  test('a pane titled "Claude Code" in a DIFFERENT tab is ignored for the tiebreak', () => {
+    const panes = [
+      // Named pane lives in the wrong tab — must not influence selection.
+      pane({ tabName: 'other-tab', paneId: 'terminal_99', title: 'Claude Code', command: 'claude --resume elsewhere', focused: false }),
+      pane({ tabName: 'tg-relay', paneId: 'terminal_1', title: 'Pane A', command: 'claude --resume a', focused: false }),
+      pane({ tabName: 'tg-relay', paneId: 'terminal_2', title: 'Pane B', command: 'claude --resume b', focused: true }),
+    ]
+    const r = resolveTargetPane(panes, { tab: 'tg-relay' })
+    expect(r.ok).toBe(true)
+    // No named pane in tg-relay → falls to focused.
+    if (r.ok) expect(r.paneId).toBe('terminal_2')
+  })
+})
+
+// ─── injectCommand — zellij stub plumbing (4-call sequence, issue #71) ────
 
 describe('injectCommand', () => {
   let dir: string
@@ -388,15 +688,57 @@ describe('injectCommand', () => {
     }
   })
 
-  // Writes an executable stub zellij. `exitCode` controls its exit status;
-  // it always appends each invocation's argv (one line, NUL-free) to <log>.
-  function writeStub(exitCode: number): { stub: string; log: string } {
+  // A canned pane table that includes a Claude pane in tab `t` with pane id
+  // `terminal_44`, plus panes in other tabs to prove tab scoping.
+  const PANE_TABLE = [
+    'TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS',
+    '0  0  other  terminal_0  terminal  Pane #1  claude --resume zzz  /tmp/other  false  false  false  0  1  43  75',
+    '5  3  t  terminal_44  terminal  Work on issue  claude --resume deadbeef  /tmp/t  false  false  false  0  1  43  75',
+    '5  3  t  terminal_45  terminal  Pane #2  /bin/zsh  /tmp/t  false  false  false  0  1  43  75',
+  ].join('\n')
+
+  // Writes an executable stub zellij.
+  //  - When invoked with a `list-panes` action, prints PANE_TABLE to stdout
+  //    and exits 0 (this is the stdout-producing call injectCommand reads).
+  //  - For any OTHER action, appends its argv (one NUL-free line) to <log>
+  //    and exits `otherExit`.
+  // `otherExit` lets a test force the focus/write branch to fail.
+  function writeStub(otherExit: number = 0): { stub: string; log: string } {
     const stub = join(dir, 'zellij-stub.sh')
+    const log = join(dir, 'invocations.log')
+    const table = PANE_TABLE
+    const script = [
+      '#!/usr/bin/env bash',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "list-panes" ]; then',
+      `    cat <<'EOF'`,
+      table,
+      'EOF',
+      '    exit 0',
+      '  fi',
+      'done',
+      `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      `exit ${otherExit}`,
+      '',
+    ].join('\n')
+    writeFileSync(stub, script)
+    chmodSync(stub, 0o755)
+    return { stub, log }
+  }
+
+  // A stub whose list-panes branch itself exits non-zero.
+  function writeListPanesFailingStub(): { stub: string; log: string } {
+    const stub = join(dir, 'zellij-stub-listfail.sh')
     const log = join(dir, 'invocations.log')
     const script = [
       '#!/usr/bin/env bash',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "list-panes" ]; then',
+      '    exit 1',
+      '  fi',
+      'done',
       `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
-      `exit ${exitCode}`,
+      'exit 0',
       '',
     ].join('\n')
     writeFileSync(stub, script)
@@ -411,50 +753,88 @@ describe('injectCommand', () => {
       .filter((l) => l.length > 0)
   }
 
-  test('successful run issues the three zellij actions in order', () => {
+  test('successful inject focuses the Claude pane then types, in order', () => {
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
     const session = 'mysession'
-    const tab = 'mytab'
+    const tab = 't'
     const commandLine = '/model opus'
 
     const result = injectCommand({ session, tab, commandLine })
     expect(result.ok).toBe(true)
 
+    // list-panes is the stdout call and is NOT in the log; the focus/write
+    // calls are. Expected order: focus-pane-id, write-chars, write 13.
     const lines = readLines(log)
     expect(lines.length).toBe(3)
-
-    // 1) go-to-tab-name <tab>
-    expect(lines[0]).toBe(`--session ${session} action go-to-tab-name ${tab}`)
-    // 2) write-chars <commandLine>
-    expect(lines[1]).toBe(`--session ${session} action write-chars ${commandLine}`)
-    // 3) write 13 (Enter)
+    expect(lines[0]).toBe(
+      `--session ${session} action focus-pane-id terminal_44`,
+    )
+    expect(lines[1]).toBe(
+      `--session ${session} action write-chars ${commandLine}`,
+    )
     expect(lines[2]).toBe(`--session ${session} action write 13`)
   })
 
-  test('each invocation carries "--session <session> action" prefix and correct args', () => {
+  test('each logged invocation carries "--session <session> action" prefix', () => {
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
     const session = 'sessA'
-    const tab = 'tabB'
-    const commandLine = '/clear'
-
-    injectCommand({ session, tab, commandLine })
+    injectCommand({ session, tab: 't', commandLine: '/clear' })
     const lines = readLines(log)
 
     for (const line of lines) {
       expect(line.startsWith(`--session ${session} action `)).toBe(true)
     }
-    expect(lines[0]).toContain(`go-to-tab-name ${tab}`)
-    expect(lines[1]).toContain(`write-chars ${commandLine}`)
+    expect(lines[0]).toContain('focus-pane-id terminal_44')
+    expect(lines[1]).toContain('write-chars /clear')
     expect(lines[2]).toContain('write 13')
   })
 
-  test('a zellij invocation that exits non-zero → { ok: false } (never throws)', () => {
+  test('tab with NO Claude pane → { ok: false } and nothing is typed', () => {
+    const { stub, log } = writeStub(0)
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+
+    let result: ReturnType<typeof injectCommand>
+    expect(() => {
+      result = injectCommand({
+        session: 's',
+        tab: 'no-such-tab',
+        commandLine: '/clear',
+      })
+    }).not.toThrow()
+    // @ts-expect-error assigned inside the closure above
+    expect(result.ok).toBe(false)
+
+    // Critically: it must NOT focus or write into any pane.
+    const lines = readLines(log)
+    for (const line of lines) {
+      expect(line).not.toContain('focus-pane-id')
+      expect(line).not.toContain('write-chars')
+      expect(line).not.toContain('write 13')
+    }
+  })
+
+  test('list-panes exiting non-zero → { ok: false } (never throws)', () => {
+    const { stub } = writeListPanesFailingStub()
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+
+    let result: ReturnType<typeof injectCommand>
+    expect(() => {
+      result = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
+    }).not.toThrow()
+    // @ts-expect-error assigned inside the closure above
+    expect(result.ok).toBe(false)
+  })
+
+  test('a focus/write step exiting non-zero → { ok: false } (never throws)', () => {
+    // list-panes still succeeds, but focus/write actions exit 1.
     const { stub } = writeStub(1)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
