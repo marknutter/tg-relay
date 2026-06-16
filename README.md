@@ -231,6 +231,37 @@ Behavior:
 
 For heartbeats that must survive session closes, keep the session alive in tmux (or a launchd wrapper). The daemon itself runs 24/7 under launchd already, but heartbeats still require a session to inject into.
 
+### Remote control (built-in commands over Telegram)
+
+Built-in Claude Code slash commands (`/clear`, `/compact`, `/model`, …) are pure terminal-client state — they have no MCP/tool/hook surface, so a relayed session normally can't trigger them. With remote control enabled, the daemon recognizes a small allowlist of these commands sent over Telegram and **injects them as keystrokes into the session's zellij pane**, letting you clear/compact context or switch models from your phone.
+
+This requires your Claude Code session to run inside a **named zellij tab** (the daemon, running headless under launchd, addresses the session by name and focuses the tab before typing). Opt in per channel by adding a `remoteControl` block to `~/.claude/channels/telegram-<name>/access.json`:
+
+```jsonc
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["5393209237"],
+  "remoteControl": {
+    "enabled": true,
+    "zellijSession": "main",     // `zellij list-sessions`
+    "zellijTab": "tg-relay",     // the tab your Claude session runs in
+    "commands": ["clear", "compact", "model"]  // optional: narrow the allowlist
+  }
+}
+```
+
+Supported commands (one-shot only): `/clear`, `/compact [hint]`, `/model <alias>`, `/fast`, `/cost`, `/context`, `/status`. `/model` takes a validated alias (`opus`, `sonnet`, `haiku`, `opusplan`, `default`, `fast`, or a `claude-*` id) and is injected directly — no picker to navigate. On success the daemon reacts ✅ to your message; invalid input gets a short reply.
+
+Security model:
+- The command allowlist is **hardcoded in the daemon**. `commands` can only narrow it, never widen it to arbitrary commands or shell input.
+- The injected string is rebuilt from validated tokens — your raw message bytes never reach the terminal. Arguments reject control characters, newlines, and shell metacharacters.
+- Off by default; only senders who already pass the channel's access gate are honored. Unknown slash commands (e.g. skills like `/code-review`) are **not** intercepted — they reach the model as usual.
+
+Caveats:
+- **Focus steal** — focusing the target tab switches your *visible* zellij tab. Irrelevant when you're away (the point), mildly annoying if you're at the desk in another tab. Prior focus is not restored.
+- **Best when idle** — if the target session is mid-response when the command lands, the keystrokes may queue. Send control commands when the session is waiting on you.
+- Override the zellij binary path with `TG_RELAY_ZELLIJ` if it's not on the daemon's minimal launchd `PATH`.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -242,6 +273,7 @@ For heartbeats that must survive session closes, keep the session alive in tmux 
 | `TG_RELAY_CHANNEL_STOP_TIMEOUT_MS` | Per-channel `bot.stop()` deadline during shutdown. Caps how long we wait for grammY's confirmation `getUpdates` to return after the abort signal fires (issue #37). | `4000` |
 | `TG_RELAY_SHUTDOWN_TIMEOUT_MS` | Global daemon-shutdown deadline. Must be less than the plist's `ExitTimeOut` (15s) so the runtime exits before launchd resorts to `SIGKILL`. Exceeding this logs a warning and exits anyway. | `10000` |
 | `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
+| `TG_RELAY_ZELLIJ` | Absolute path to the `zellij` binary for remote-control keystroke injection. Resolved from common locations / login shell if unset. | _(auto-detected)_ |
 
 ## Development
 

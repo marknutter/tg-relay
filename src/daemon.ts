@@ -32,6 +32,7 @@ import { loadHeartbeats, reconcileSchedules, type HeartbeatConfig, type Heartbea
 import { openPending, buildReplay, type PendingHandle } from './pending.js'
 import { runPollingLoop } from './polling.js'
 import { stopBotWithTimeout } from './shutdown.js'
+import { parseControlCommand, injectCommand, type RemoteControlConfig } from './remote-control.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -125,6 +126,7 @@ type Access = {
   replyToMode?: 'off' | 'first' | 'all'
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
+  remoteControl?: RemoteControlConfig
 }
 
 function defaultAccess(): Access {
@@ -146,6 +148,7 @@ function readAccessFile(stateDir: string): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      remoteControl: parsed.remoteControl,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -764,6 +767,41 @@ function setupInboundHandlers(state: ChannelState): void {
         ]).catch(() => {})
       }
       return
+    }
+
+    // Remote-control intercept (#71): a small hardcoded allowlist of built-in
+    // Claude Code slash commands (/clear, /compact, /model …) injected as
+    // keystrokes into the session's zellij pane. Deterministic and daemon-side
+    // so the model is never in the privileged path. Off unless configured per
+    // channel via access.json → remoteControl. Unknown slash commands (skills
+    // like /code-review) parse as 'not-command' and fall through to the model.
+    const rc = access.remoteControl
+    if (rc?.enabled && rc.zellijSession && rc.zellijTab) {
+      const parsed = parseControlCommand(text, rc.commands)
+      if (parsed.kind === 'error') {
+        await bot.api.sendMessage(chat_id, parsed.message).catch(() => {})
+        return
+      }
+      if (parsed.kind === 'inject') {
+        const res = injectCommand({
+          session: rc.zellijSession,
+          tab: rc.zellijTab,
+          commandLine: parsed.keystrokes,
+        })
+        if (res.ok) {
+          if (msgId != null) {
+            void bot.api.setMessageReaction(chat_id, msgId, [
+              { type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] },
+            ]).catch(() => {})
+          }
+          log(channelName, `remote-control: injected '${parsed.command}' into ${rc.zellijSession}:${rc.zellijTab}`)
+        } else {
+          await bot.api.sendMessage(chat_id, `⚠️ couldn't run ${parsed.command}: ${res.error}`).catch(() => {})
+          log(channelName, `remote-control: inject failed for '${parsed.command}': ${res.error}`)
+        }
+        return
+      }
+      // parsed.kind === 'not-command' → fall through to normal handling.
     }
 
     // Typing indicator
