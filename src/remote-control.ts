@@ -381,7 +381,14 @@ export async function injectCommand(opts: {
   const paneId = resolved.paneId
 
   try {
-    execFileSync(zellij, [...base, 'focus-pane-id', paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      execFileSync(zellij, [...base, 'focus-pane-id', paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (err) {
+      // zellij exits non-zero if the pane is ALREADY focused — that's exactly
+      // the state we want (common when a prior command already switched to it),
+      // so tolerate it and proceed. Rethrow any other focus failure.
+      if (!/already focused/i.test(zellijError(err, 'focus'))) throw err
+    }
     execFileSync(zellij, [...base, 'write-chars', opts.commandLine], { stdio: ['ignore', 'pipe', 'pipe'] })
     // 13 = carriage return (Enter) to submit the command.
     execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })

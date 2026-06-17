@@ -770,6 +770,63 @@ describe('injectCommand', () => {
     writeFileSync(screenFile, contents)
   }
 
+  // A stub whose `focus-pane-id` branch fails per a baked-in control file,
+  // while every OTHER action (write-chars, write 13, dump-screen) still
+  // succeeds. list-panes prints PANE_TABLE as usual.
+  //
+  // The control file's contents decide focus-pane-id's behavior:
+  //   'already-focused' → prints "Pane Terminal(44) is already focused" to
+  //                       STDERR and exits 1 (the tolerated failure).
+  //   'other-error'     → prints "some other failure" to STDERR, exits 1.
+  //   anything else     → exits 0 (focus succeeds).
+  // The control file path is baked into the script (NOT an env var) for the
+  // same reason as screenFile: env writes don't reach execFileSync children.
+  function writeFocusStub(controlContents: string): {
+    stub: string
+    log: string
+    control: string
+  } {
+    const stub = join(dir, 'zellij-stub-focus.sh')
+    const log = join(dir, 'invocations.log')
+    const control = join(dir, 'focus-control.txt')
+    writeFileSync(control, controlContents)
+    const table = PANE_TABLE
+    const script = [
+      '#!/usr/bin/env bash',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "list-panes" ]; then',
+      `    cat <<'EOF'`,
+      table,
+      'EOF',
+      '    exit 0',
+      '  fi',
+      '  if [ "$arg" = "dump-screen" ]; then',
+      `    printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      '    exit 0',
+      '  fi',
+      '  if [ "$arg" = "focus-pane-id" ]; then',
+      `    printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      `    ctl="$(cat ${JSON.stringify(control)})"`,
+      '    if [ "$ctl" = "already-focused" ]; then',
+      '      echo "Pane Terminal(44) is already focused" >&2',
+      '      exit 1',
+      '    fi',
+      '    if [ "$ctl" = "other-error" ]; then',
+      '      echo "some other failure" >&2',
+      '      exit 1',
+      '    fi',
+      '    exit 0',
+      '  fi',
+      'done',
+      `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      'exit 0',
+      '',
+    ].join('\n')
+    writeFileSync(stub, script)
+    chmodSync(stub, 0o755)
+    return { stub, log, control }
+  }
+
   // A stub whose list-panes branch itself exits non-zero.
   function writeListPanesFailingStub(): { stub: string; log: string } {
     const stub = join(dir, 'zellij-stub-listfail.sh')
@@ -1011,5 +1068,56 @@ describe('injectCommand', () => {
     }
     // Only the 3 command actions were logged.
     expect(lines.length).toBe(3)
+  })
+
+  // ─── focus-pane-id "already focused" tolerance (bug fix) ───────────────
+
+  test('focus-pane-id fails with "already focused" → still types, ok:true', async () => {
+    // focus-pane-id exits 1 with stderr containing "already focused".
+    // The fix: this is tolerated — injectCommand proceeds to type.
+    const { stub, log } = writeFocusStub('already-focused')
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
+    expect(result.ok).toBe(true)
+
+    const lines = readLines(log)
+    // The command was typed despite the focus "failure".
+    const idxFocus = lines.findIndex((l) =>
+      l.includes('focus-pane-id terminal_44'),
+    )
+    const idxChars = lines.findIndex(
+      (l) => l === '--session s action write-chars /clear',
+    )
+    const idxEnter = lines.findIndex((l) => l === '--session s action write 13')
+    expect(idxFocus).toBeGreaterThanOrEqual(0)
+    expect(idxChars).toBeGreaterThan(idxFocus)
+    expect(idxEnter).toBeGreaterThan(idxChars)
+  })
+
+  test('focus-pane-id fails with a DIFFERENT error → ok:false, nothing typed', async () => {
+    // focus-pane-id exits 1 with stderr NOT containing "already focused".
+    // This stays fatal — no typing must occur.
+    const { stub, log } = writeFocusStub('other-error')
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
+    expect(result.ok).toBe(false)
+
+    const lines = readLines(log)
+    for (const line of lines) {
+      expect(line).not.toContain('write-chars')
+      expect(line).not.toContain('write 13')
+    }
   })
 })
