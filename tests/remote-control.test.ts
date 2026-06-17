@@ -20,10 +20,13 @@
  *   resolveTargetPane(panes, { tab }) — pure. Finds the unique Claude pane
  *   in the target tab to focus before typing.
  *
- *   injectCommand({ session, tab, commandLine }) — side-effecting. Runs
- *   zellij four times: it reads `list-panes --all` stdout to resolve the
- *   Claude pane, then focus-pane-id <id>, write-chars <commandLine>,
- *   write 13. Tested with a stub zellij binary forced via the
+ *   injectCommand({ session, tab, commandLine, confirm? }) — side-effecting,
+ *   ASYNC (returns a Promise). Runs zellij: it reads `list-panes --all`
+ *   stdout to resolve the Claude pane, then focus-pane-id <id>,
+ *   write-chars <commandLine>, write 13. If a `confirm` option is supplied,
+ *   it then polls the target pane via `action dump-screen --pane-id <id>`
+ *   and, if the dumped text matches the detect pattern, sends the confirm
+ *   key + Enter. Tested with a stub zellij binary forced via the
  *   TG_RELAY_ZELLIJ env var; the resolved path is cached so we call
  *   _resetZellijCache() before each env change.
  */
@@ -183,6 +186,11 @@ describe('parseControlCommand — non-slash text → not-command', () => {
 describe('parseControlCommand — no-argument commands', () => {
   const noArg = ['clear', 'fast', 'cost', 'context', 'status'] as const
 
+  test('"/clear" inject result has NO confirm dialog descriptor', () => {
+    const r = expectInject('/clear')
+    expect(r.confirm).toBeUndefined()
+  })
+
   for (const cmd of noArg) {
     test(`bare "/${cmd}" → inject "/${cmd}"`, () => {
       const r = expectInject(`/${cmd}`)
@@ -281,6 +289,17 @@ describe('parseControlCommand — model', () => {
 
   test('"/model opus extra" → error (too many args)', () => {
     expectError('/model opus extra')
+  })
+
+  test('"/model opus" inject result carries a confirm dialog descriptor', () => {
+    const r = expectInject('/model opus')
+    expect(r.command).toBe('/model')
+    expect(r.keystrokes).toBe('/model opus')
+    // The model switch requires accepting a confirmation dialog.
+    expect(r.confirm).toBeDefined()
+    expect(r.confirm.key).toBe('1')
+    expect(typeof r.confirm.detectPattern).toBe('string')
+    expect(r.confirm.detectPattern.length).toBeGreaterThan(0)
   })
 
   test('injected model keystroke value matches ^[a-z0-9.-]+$', () => {
@@ -700,12 +719,26 @@ describe('injectCommand', () => {
   // Writes an executable stub zellij.
   //  - When invoked with a `list-panes` action, prints PANE_TABLE to stdout
   //    and exits 0 (this is the stdout-producing call injectCommand reads).
+  //  - When invoked with a `dump-screen` action, prints the contents of the
+  //    canned screen file (a fixed path baked into the script — NOT via an
+  //    env var, because bun's `process.env` writes don't reach execFileSync
+  //    children) to stdout and exits 0. It ALSO appends its argv to the log
+  //    so tests can assert whether dump-screen was invoked at all.
   //  - For any OTHER action, appends its argv (one NUL-free line) to <log>
   //    and exits `otherExit`.
   // `otherExit` lets a test force the focus/write branch to fail.
-  function writeStub(otherExit: number = 0): { stub: string; log: string } {
+  // The screen file starts empty (dialog absent); call setStubScreen() to
+  // make the dialog "appear".
+  function writeStub(otherExit: number = 0): {
+    stub: string
+    log: string
+    screenFile: string
+  } {
     const stub = join(dir, 'zellij-stub.sh')
     const log = join(dir, 'invocations.log')
+    const screenFile = join(dir, 'screen.txt')
+    // Default: empty screen → dialog never appears.
+    writeFileSync(screenFile, '')
     const table = PANE_TABLE
     const script = [
       '#!/usr/bin/env bash',
@@ -716,6 +749,11 @@ describe('injectCommand', () => {
       'EOF',
       '    exit 0',
       '  fi',
+      '  if [ "$arg" = "dump-screen" ]; then',
+      `    printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      `    cat ${JSON.stringify(screenFile)}`,
+      '    exit 0',
+      '  fi',
       'done',
       `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
       `exit ${otherExit}`,
@@ -723,7 +761,13 @@ describe('injectCommand', () => {
     ].join('\n')
     writeFileSync(stub, script)
     chmodSync(stub, 0o755)
-    return { stub, log }
+    return { stub, log, screenFile }
+  }
+
+  // Overwrites the stub's canned screen file. Pass the dialog text to make
+  // the dialog "appear"; pass '' to keep it absent.
+  function setStubScreen(screenFile: string, contents: string): void {
+    writeFileSync(screenFile, contents)
   }
 
   // A stub whose list-panes branch itself exits non-zero.
@@ -753,7 +797,7 @@ describe('injectCommand', () => {
       .filter((l) => l.length > 0)
   }
 
-  test('successful inject focuses the Claude pane then types, in order', () => {
+  test('successful inject focuses the Claude pane then types, in order', async () => {
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
@@ -762,7 +806,7 @@ describe('injectCommand', () => {
     const tab = 't'
     const commandLine = '/model opus'
 
-    const result = injectCommand({ session, tab, commandLine })
+    const result = await injectCommand({ session, tab, commandLine })
     expect(result.ok).toBe(true)
 
     // list-panes is the stdout call and is NOT in the log; the focus/write
@@ -778,13 +822,13 @@ describe('injectCommand', () => {
     expect(lines[2]).toBe(`--session ${session} action write 13`)
   })
 
-  test('each logged invocation carries "--session <session> action" prefix', () => {
+  test('each logged invocation carries "--session <session> action" prefix', async () => {
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
     const session = 'sessA'
-    injectCommand({ session, tab: 't', commandLine: '/clear' })
+    await injectCommand({ session, tab: 't', commandLine: '/clear' })
     const lines = readLines(log)
 
     for (const line of lines) {
@@ -795,20 +839,16 @@ describe('injectCommand', () => {
     expect(lines[2]).toContain('write 13')
   })
 
-  test('tab with NO Claude pane → { ok: false } and nothing is typed', () => {
+  test('tab with NO Claude pane → { ok: false } and nothing is typed', async () => {
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
-    let result: ReturnType<typeof injectCommand>
-    expect(() => {
-      result = injectCommand({
-        session: 's',
-        tab: 'no-such-tab',
-        commandLine: '/clear',
-      })
-    }).not.toThrow()
-    // @ts-expect-error assigned inside the closure above
+    const result = await injectCommand({
+      session: 's',
+      tab: 'no-such-tab',
+      commandLine: '/clear',
+    })
     expect(result.ok).toBe(false)
 
     // Critically: it must NOT focus or write into any pane.
@@ -820,63 +860,156 @@ describe('injectCommand', () => {
     }
   })
 
-  test('list-panes exiting non-zero → { ok: false } (never throws)', () => {
+  test('list-panes exiting non-zero → { ok: false } (never throws)', async () => {
     const { stub } = writeListPanesFailingStub()
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
-    let result: ReturnType<typeof injectCommand>
-    expect(() => {
-      result = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
-    }).not.toThrow()
-    // @ts-expect-error assigned inside the closure above
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
     expect(result.ok).toBe(false)
   })
 
-  test('a focus/write step exiting non-zero → { ok: false } (never throws)', () => {
+  test('a focus/write step exiting non-zero → { ok: false } (never throws)', async () => {
     // list-panes still succeeds, but focus/write actions exit 1.
     const { stub } = writeStub(1)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
 
-    let result: ReturnType<typeof injectCommand>
-    expect(() => {
-      result = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
-    }).not.toThrow()
-    // @ts-expect-error assigned inside the closure above
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
     expect(result.ok).toBe(false)
   })
 
-  test('non-existent binary path → { ok: false } (never throws)', () => {
+  test('non-existent binary path → { ok: false } (never throws)', async () => {
     const ghost = join(dir, 'does-not-exist-zellij')
     expect(existsSync(ghost)).toBe(false)
     process.env.TG_RELAY_ZELLIJ = ghost
     _resetZellijCache()
 
-    let result: ReturnType<typeof injectCommand>
-    expect(() => {
-      result = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
-    }).not.toThrow()
-    // @ts-expect-error assigned inside the closure above
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
     expect(result.ok).toBe(false)
-    // @ts-expect-error error branch
-    expect(typeof result.error).toBe('string')
+    if (!result.ok) expect(typeof result.error).toBe('string')
   })
 
-  test('_resetZellijCache lets a later env change take effect', () => {
+  test('_resetZellijCache lets a later env change take effect', async () => {
     // First: a failing binary.
     const ghost = join(dir, 'nope-zellij')
     process.env.TG_RELAY_ZELLIJ = ghost
     _resetZellijCache()
-    const first = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
+    const first = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
     expect(first.ok).toBe(false)
 
     // Then: a working stub, after resetting the cache.
     const { stub, log } = writeStub(0)
     process.env.TG_RELAY_ZELLIJ = stub
     _resetZellijCache()
-    const second = injectCommand({ session: 's', tab: 't', commandLine: '/clear' })
+    const second = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
     expect(second.ok).toBe(true)
     expect(readLines(log).length).toBe(3)
+  })
+
+  // ─── confirmation dialog handling (issue #71, change 2) ────────────────
+
+  test('confirm dialog appears → confirm key + Enter are sent after the command', async () => {
+    const { stub, log, screenFile } = writeStub(0)
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+    // Make the dialog "appear": dumped screen contains the detect text.
+    setStubScreen(screenFile, 'Some banner\nSwitch model?\n  1. Yes\n  2. No\n')
+
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/model sonnet',
+      confirm: { detectPattern: 'switch model\\?|yes, switch to', key: '1' },
+    })
+    expect(result.ok).toBe(true)
+
+    // Filter to the focus/write actions (dump-screen lines are also logged).
+    const lines = readLines(log)
+    const writeChars = lines.filter((l) => l.includes('action write-chars'))
+    const writeEnter = lines.filter((l) =>
+      /action write 13$/.test(l),
+    )
+
+    // The command keystrokes come first, then the confirm key.
+    expect(writeChars[0]).toBe('--session s action write-chars /model sonnet')
+    expect(writeChars[1]).toBe('--session s action write-chars 1')
+    expect(writeChars.length).toBe(2)
+    // Two Enters: one to submit the command, one to accept the dialog.
+    expect(writeEnter.length).toBe(2)
+
+    // Confirm key keystroke must come AFTER the command keystroke + its Enter.
+    const idxCmd = lines.findIndex((l) =>
+      l.includes('write-chars /model sonnet'),
+    )
+    const idxKey = lines.findIndex((l) => l === '--session s action write-chars 1')
+    expect(idxCmd).toBeGreaterThanOrEqual(0)
+    expect(idxKey).toBeGreaterThan(idxCmd)
+  })
+
+  test('confirm dialog never appears → NO confirm key is sent', async () => {
+    const { stub, log, screenFile } = writeStub(0)
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+    // Dialog never appears: dumped screen has unrelated/empty text.
+    setStubScreen(screenFile, '')
+
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/model sonnet',
+      confirm: { detectPattern: 'switch model\\?|yes, switch to', key: '1' },
+    })
+    // Result stays ok — the command itself was submitted.
+    expect(result.ok).toBe(true)
+
+    const lines = readLines(log)
+    const writeChars = lines.filter((l) => l.includes('action write-chars'))
+    // Exactly ONE write-chars: the command. No stray confirm key leaked.
+    expect(writeChars.length).toBe(1)
+    expect(writeChars[0]).toBe('--session s action write-chars /model sonnet')
+    for (const l of lines) {
+      expect(l).not.toBe('--session s action write-chars 1')
+    }
+  }, 15000)
+
+  test('no confirm option → dump-screen is never invoked', async () => {
+    const { stub, log } = writeStub(0)
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+
+    const result = await injectCommand({
+      session: 's',
+      tab: 't',
+      commandLine: '/clear',
+    })
+    expect(result.ok).toBe(true)
+
+    const lines = readLines(log)
+    for (const l of lines) {
+      expect(l).not.toContain('dump-screen')
+    }
+    // Only the 3 command actions were logged.
+    expect(lines.length).toBe(3)
   })
 })

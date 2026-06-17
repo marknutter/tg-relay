@@ -786,10 +786,11 @@ function setupInboundHandlers(state: ChannelState): void {
         return
       }
       if (parsed.kind === 'inject') {
-        const res = injectCommand({
+        const res = await injectCommand({
           session: rc.zellijSession,
           tab,
           commandLine: parsed.keystrokes,
+          ...(parsed.confirm ? { confirm: parsed.confirm } : {}),
         })
         if (res.ok) {
           if (msgId != null) {

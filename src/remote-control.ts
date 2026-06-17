@@ -49,6 +49,19 @@ const MODEL_ID_RE = /^claude-[a-z0-9.-]+$/
 type ArgCheck = { ok: true; value: string } | { ok: false; message: string }
 type ArgValidator = (arg: string) => ArgCheck
 
+/**
+ * Some built-ins open a confirmation dialog after submission (e.g. /model warns
+ * that switching invalidates the prompt cache). After typing the command we
+ * read the pane; only if `detectPattern` matches do we send `key` to confirm —
+ * so a missing/changed dialog can never leak a stray keystroke into the prompt.
+ */
+export type ConfirmSpec = {
+  /** Case-insensitive regex source matched against the pane's screen dump. */
+  detectPattern: string
+  /** Keystroke to send to accept the dialog (e.g. "1" for "1. Yes"). */
+  key: string
+}
+
 type CommandSpec = {
   /** Command name without the slash, e.g. "clear". */
   name: string
@@ -56,6 +69,8 @@ type CommandSpec = {
   arg: 'none' | 'optional' | 'required'
   /** Validates/normalizes the argument when one is present. */
   validateArg?: ArgValidator
+  /** Post-submission confirmation dialog to auto-accept, if any. */
+  confirm?: ConfirmSpec
 }
 
 /** Any control char or newline — always forbidden in an injected argument. */
@@ -99,7 +114,14 @@ const validateFreeHint: ArgValidator = (arg) => {
 const COMMANDS: Record<string, CommandSpec> = {
   clear: { name: 'clear', arg: 'none' },
   compact: { name: 'compact', arg: 'optional', validateArg: validateFreeHint },
-  model: { name: 'model', arg: 'required', validateArg: validateModelAlias },
+  model: {
+    name: 'model',
+    arg: 'required',
+    validateArg: validateModelAlias,
+    // Newer Claude Code asks "Switch model?" (cache-invalidation warning) with
+    // "1. Yes" / "2. No". Detect it and press 1 to accept.
+    confirm: { detectPattern: 'switch model\\?|yes, switch to', key: '1' },
+  },
   fast: { name: 'fast', arg: 'none' },
   cost: { name: 'cost', arg: 'none' },
   context: { name: 'context', arg: 'none' },
@@ -113,7 +135,7 @@ export type ParseResult =
   /** Not a recognized control command — caller should handle normally (enqueue to model). */
   | { kind: 'not-command' }
   /** Recognized & valid — `keystrokes` is the exact line to type; `command` is a human label. */
-  | { kind: 'inject'; command: string; keystrokes: string }
+  | { kind: 'inject'; command: string; keystrokes: string; confirm?: ConfirmSpec }
   /** Recognized but the argument was missing/invalid — caller should reply with `message`. */
   | { kind: 'error'; command: string; message: string }
 
@@ -146,10 +168,16 @@ export function parseControlCommand(rawText: string, allowed?: string[]): ParseR
 
   const label = `/${name}`
   const argStr = rawArg != null ? rawArg.trim() : ''
+  const inject = (keystrokes: string): ParseResult => ({
+    kind: 'inject',
+    command: label,
+    keystrokes,
+    ...(spec.confirm ? { confirm: spec.confirm } : {}),
+  })
 
   if (spec.arg === 'none') {
     if (argStr) return { kind: 'error', command: label, message: `${label} takes no arguments.` }
-    return { kind: 'inject', command: label, keystrokes: label }
+    return inject(label)
   }
 
   if (spec.arg === 'required' && !argStr) {
@@ -163,20 +191,20 @@ export function parseControlCommand(rawText: string, allowed?: string[]): ParseR
 
   // optional with no arg → inject bare command
   if (spec.arg === 'optional' && !argStr) {
-    return { kind: 'inject', command: label, keystrokes: label }
+    return inject(label)
   }
 
   // We have an argument to validate.
   if (spec.validateArg) {
     const checked = spec.validateArg(argStr)
     if (!checked.ok) return { kind: 'error', command: label, message: checked.message }
-    return { kind: 'inject', command: label, keystrokes: `${label} ${checked.value}` }
+    return inject(`${label} ${checked.value}`)
   }
 
   // No validator but arg allowed: only reached if a spec forgot a validator.
   // Be safe: reject control chars, then inject verbatim.
   if (hasControlChars(argStr)) return { kind: 'error', command: label, message: 'Argument contains invalid characters.' }
-  return { kind: 'inject', command: label, keystrokes: `${label} ${argStr}` }
+  return inject(`${label} ${argStr}`)
 }
 
 // ── zellij injection (side-effecting) ──────────────────────────────────────
@@ -313,14 +341,27 @@ function zellijError(err: unknown, what: string): string {
   return stderr || e.message || `zellij ${what} failed`
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// Confirmation-dialog polling: how long to wait for the dialog to render, and
+// how often to re-read the pane while waiting.
+const CONFIRM_POLL_ATTEMPTS = 8
+const CONFIRM_POLL_INTERVAL_MS = 250
+
 /**
  * Find the Claude pane in `tab`, focus it by id, then type `commandLine` + Enter.
- * Every step is a blocking zellij invocation; any failure (binary missing,
- * session/tab gone, no resolvable Claude pane) returns `{ ok: false }` rather
- * than throwing — and crucially, we never type into a pane we couldn't confirm
- * is Claude.
+ * If `confirm` is set, poll the pane afterward and only press the confirm key if
+ * the dialog actually appears (so a missing/changed dialog never leaks a stray
+ * keystroke). Any failure (binary missing, session/tab gone, no resolvable
+ * Claude pane) returns `{ ok: false }` rather than throwing — and crucially, we
+ * never type into a pane we couldn't confirm is Claude.
  */
-export function injectCommand(opts: { session: string; tab: string; commandLine: string }): InjectResult {
+export async function injectCommand(opts: {
+  session: string
+  tab: string
+  commandLine: string
+  confirm?: ConfirmSpec
+}): Promise<InjectResult> {
   const zellij = resolveZellij()
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
   const base = ['--session', opts.session, 'action']
@@ -337,14 +378,58 @@ export function injectCommand(opts: { session: string; tab: string; commandLine:
 
   const resolved = resolveTargetPane(parseListPanes(panesOut), { tab: opts.tab })
   if (!resolved.ok) return { ok: false, error: resolved.error }
+  const paneId = resolved.paneId
 
   try {
-    execFileSync(zellij, [...base, 'focus-pane-id', resolved.paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
+    execFileSync(zellij, [...base, 'focus-pane-id', paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
     execFileSync(zellij, [...base, 'write-chars', opts.commandLine], { stdio: ['ignore', 'pipe', 'pipe'] })
     // 13 = carriage return (Enter) to submit the command.
     execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
-    return { ok: true }
   } catch (err) {
     return { ok: false, error: zellijError(err, 'inject') }
+  }
+
+  if (opts.confirm) {
+    try {
+      await handleConfirmation(zellij, base, paneId, opts.confirm)
+    } catch (err) {
+      // The command itself was submitted; a confirm hiccup shouldn't report the
+      // whole op as failed. Surface nothing — worst case the user accepts the
+      // dialog manually.
+      return { ok: true }
+    }
+  }
+
+  return { ok: true }
+}
+
+/**
+ * Read the pane (without focusing it) up to a few times; the moment the dialog
+ * `detectPattern` appears, press `key` + Enter to accept it. If it never
+ * appears, do nothing.
+ */
+async function handleConfirmation(
+  zellij: string,
+  base: string[],
+  paneId: string,
+  confirm: ConfirmSpec,
+): Promise<void> {
+  const re = new RegExp(confirm.detectPattern, 'i')
+  for (let i = 0; i < CONFIRM_POLL_ATTEMPTS; i++) {
+    await sleep(CONFIRM_POLL_INTERVAL_MS)
+    let screen = ''
+    try {
+      screen = execFileSync(zellij, [...base, 'dump-screen', '--pane-id', paneId], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch {
+      continue // transient read failure — try again
+    }
+    if (re.test(screen)) {
+      execFileSync(zellij, [...base, 'write-chars', confirm.key], { stdio: ['ignore', 'pipe', 'pipe'] })
+      execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      return
+    }
   }
 }
