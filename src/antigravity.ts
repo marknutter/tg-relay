@@ -61,6 +61,17 @@ export type AntigravityConfig = {
   /** zellij tab name the agy pane lives in (defaults to the channel name). */
   zellijTab?: string
   /**
+   * How agy's replies reach Telegram (default "mcp"):
+   *   "mcp"        — agy calls the reply MCP tool (src/plugin.ts) itself, like
+   *                  Claude Code. agy is aware of the bridge and chooses when to
+   *                  message; requires agy to load the plugin + a GEMINI.md note.
+   *   "transcript" — the daemon tails agy's transcript and relays completed
+   *                  assistant turns. Zero agy cooperation, never misses, but
+   *                  agy is unaware (relays its narration, can't attach files).
+   * Inbound (Telegram → agy) is always zellij keystroke injection regardless.
+   */
+  outbound?: 'mcp' | 'transcript'
+  /**
    * Optional zellij pane TITLE that pins the agy pane. agy's binary is often
    * hot-swapped by self-update, which leaves the running process executing a
    * renamed inode that zellij can't resolve a command name for (it reports
@@ -447,4 +458,23 @@ export function saveAntigravityState(stateDir: string, st: AntigravityState): vo
   const tmp = p + '.tmp'
   writeFileSync(tmp, JSON.stringify(st, null, 2) + '\n', { mode: 0o600 })
   renameSync(tmp, p)
+}
+
+// ── Outbound mode + reply chat_id default ────────────────────────────────────
+
+/** Normalize the configured outbound mode; anything but "transcript" is "mcp". */
+export function normalizeOutboundMode(value: unknown): 'mcp' | 'transcript' {
+  return value === 'transcript' ? 'transcript' : 'mcp'
+}
+
+/**
+ * Resolve the chat to send a reply to. Uses the provided chat_id when present
+ * (Claude always supplies it); otherwise falls back to the channel's primary
+ * allowlisted DM (`allowFrom[0]`) — the agy path, where inbound arrived via
+ * zellij and no chat_id is known. Returns undefined if neither is available.
+ */
+export function defaultReplyChatId(provided: string | undefined, allowFrom: string[]): string | undefined {
+  const p = provided?.trim()
+  if (p) return p
+  return allowFrom[0]
 }

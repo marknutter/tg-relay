@@ -38,6 +38,7 @@ import {
   defaultBrainRoot, resolveActiveConversation, maxStepIndexInFile,
   readNewTurns, isBusyByMtime, resolveAgyPane, injectAgyProse,
   loadAntigravityState, saveAntigravityState,
+  normalizeOutboundMode, defaultReplyChatId,
 } from './antigravity.js'
 import type {
   DaemonToPlugin, InboundMessage,
@@ -514,7 +515,12 @@ async function handlePluginMessage(
   try {
     switch (msg.type) {
       case 'reply': {
-        assertAllowedChat(state.config.stateDir, msg.chat_id)
+        // A reply may omit chat_id (the Antigravity adapter injects inbound via
+        // zellij, so agy never sees one over MCP) — default to the channel's
+        // primary DM. Claude always passes chat_id through from the inbound.
+        const chatId = defaultReplyChatId(msg.chat_id, readAccessFile(state.config.stateDir).allowFrom)
+        if (!chatId) throw new Error('reply has no chat_id and channel has no allowFrom default')
+        assertAllowedChat(state.config.stateDir, chatId)
         const reply_to = msg.reply_to != null ? Number(msg.reply_to) : undefined
 
         const files = msg.files ?? []
@@ -536,10 +542,10 @@ async function handlePluginMessage(
           const oggPath = await synthesizeVoice(msg.text, state.config.name)
           if (oggPath) {
             try {
-              await state.bot.api.sendVoice(msg.chat_id, new InputFile(oggPath), {
+              await state.bot.api.sendVoice(chatId, new InputFile(oggPath), {
                 ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
               })
-              log(state.config.name, `voice reply sent to chat ${msg.chat_id} (${msg.text.length} chars)`)
+              log(state.config.name, `voice reply sent to chat ${chatId} (${msg.text.length} chars)`)
               try { rmSync(oggPath, { force: true }) } catch {}
               break
             } catch (err) {
@@ -556,7 +562,7 @@ async function handlePluginMessage(
 
         for (let i = 0; i < chunks.length; i++) {
           const shouldReplyTo = reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
-          await state.bot.api.sendMessage(msg.chat_id, chunks[i], {
+          await state.bot.api.sendMessage(chatId, chunks[i], {
             ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
           })
         }
@@ -568,12 +574,12 @@ async function handlePluginMessage(
             ? { reply_parameters: { message_id: reply_to } }
             : undefined
           if (PHOTO_EXTS.has(ext)) {
-            await state.bot.api.sendPhoto(msg.chat_id, input, opts)
+            await state.bot.api.sendPhoto(chatId, input, opts)
           } else {
-            await state.bot.api.sendDocument(msg.chat_id, input, opts)
+            await state.bot.api.sendDocument(chatId, input, opts)
           }
         }
-        log(state.config.name, `reply sent to chat ${msg.chat_id}`)
+        log(state.config.name, `reply sent to chat ${chatId}`)
         break
       }
 
@@ -1249,9 +1255,13 @@ async function antigravityTick(state: ChannelState): Promise<void> {
   try {
     const brainRoot = rt.config.brainRoot ?? defaultBrainRoot()
     const active = resolveActiveConversation(brainRoot)
+    const outboundMode = normalizeOutboundMode(rt.config.outbound)
 
-    // Outbound: follow the newest conversation and relay completed turns.
-    if (active) {
+    // Outbound: in "transcript" mode, follow the newest conversation and relay
+    // completed turns. In "mcp" mode the daemon relays nothing — agy sends its
+    // own replies via the reply MCP tool — but `active` is still resolved above
+    // because the inbound idle-gate uses the transcript's write recency.
+    if (active && outboundMode === 'transcript') {
       if (active.convId !== rt.state.convId) {
         // New/changed conversation: adopt at its tip so prior history isn't
         // replayed; only turns produced from here on are relayed.

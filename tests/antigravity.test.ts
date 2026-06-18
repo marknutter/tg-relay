@@ -47,6 +47,8 @@ import {
   injectAgyProse,
   resolveAgyPane,
   resolveAgyPaneFromList,
+  normalizeOutboundMode,
+  defaultReplyChatId,
   type AgyRecord,
   type AntigravityState,
 } from '../src/antigravity.js'
@@ -1173,5 +1175,113 @@ describe('resolveAgyPaneFromList', () => {
       expect(r.paneId).toBe('terminal_1')
       expect(r.via).toBe('sole-terminal')
     }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════
+//  normalizeOutboundMode — outbound mode coercion
+// ════════════════════════════════════════════════════════════════════════
+
+describe('normalizeOutboundMode', () => {
+  test("exact 'transcript' → 'transcript'", () => {
+    expect(normalizeOutboundMode('transcript')).toBe('transcript')
+  })
+
+  test("'mcp' → 'mcp'", () => {
+    expect(normalizeOutboundMode('mcp')).toBe('mcp')
+  })
+
+  test('undefined → mcp (default)', () => {
+    expect(normalizeOutboundMode(undefined)).toBe('mcp')
+  })
+
+  test('null → mcp', () => {
+    expect(normalizeOutboundMode(null)).toBe('mcp')
+  })
+
+  test('empty string → mcp', () => {
+    expect(normalizeOutboundMode('')).toBe('mcp')
+  })
+
+  test("wrong case 'MCP' → mcp", () => {
+    expect(normalizeOutboundMode('MCP')).toBe('mcp')
+  })
+
+  test("wrong case 'Transcript' → mcp (exact match required)", () => {
+    expect(normalizeOutboundMode('Transcript')).toBe('mcp')
+  })
+
+  test("wrong case 'TRANSCRIPT' → mcp", () => {
+    expect(normalizeOutboundMode('TRANSCRIPT')).toBe('mcp')
+  })
+
+  test("padded ' transcript ' → mcp (no trimming, exact match only)", () => {
+    expect(normalizeOutboundMode(' transcript ')).toBe('mcp')
+  })
+
+  test('arbitrary string → mcp', () => {
+    expect(normalizeOutboundMode('something-else')).toBe('mcp')
+  })
+
+  test('number → mcp', () => {
+    expect(normalizeOutboundMode(42)).toBe('mcp')
+  })
+
+  test('object → mcp', () => {
+    expect(normalizeOutboundMode({ mode: 'transcript' })).toBe('mcp')
+  })
+
+  test('boolean true → mcp', () => {
+    expect(normalizeOutboundMode(true)).toBe('mcp')
+  })
+
+  test('boolean false → mcp', () => {
+    expect(normalizeOutboundMode(false)).toBe('mcp')
+  })
+
+  test('array → mcp', () => {
+    expect(normalizeOutboundMode(['transcript'])).toBe('mcp')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════
+//  defaultReplyChatId — provided-or-first-allowed selection
+// ════════════════════════════════════════════════════════════════════════
+
+describe('defaultReplyChatId', () => {
+  test('provided non-empty string → returned trimmed', () => {
+    expect(defaultReplyChatId('  123  ', ['111', '222'])).toBe('123')
+  })
+
+  test('provided already-trimmed string → returned as-is', () => {
+    expect(defaultReplyChatId('555', ['111'])).toBe('555')
+  })
+
+  test('provided undefined → first allowFrom element', () => {
+    expect(defaultReplyChatId(undefined, ['111', '222'])).toBe('111')
+  })
+
+  test('provided empty string → first allowFrom element', () => {
+    expect(defaultReplyChatId('', ['999'])).toBe('999')
+  })
+
+  test('provided whitespace-only → first allowFrom element', () => {
+    expect(defaultReplyChatId('   ', ['999'])).toBe('999')
+  })
+
+  test('provided undefined + empty allowFrom → undefined', () => {
+    expect(defaultReplyChatId(undefined, [])).toBe(undefined)
+  })
+
+  test('provided whitespace-only + empty allowFrom → undefined', () => {
+    expect(defaultReplyChatId('  \t ', [])).toBe(undefined)
+  })
+
+  test('provided present even when allowFrom is empty → returns provided', () => {
+    expect(defaultReplyChatId('123', [])).toBe('123')
+  })
+
+  test('provided present (trimmed) takes precedence over allowFrom', () => {
+    expect(defaultReplyChatId('  abc  ', ['xyz'])).toBe('abc')
   })
 })

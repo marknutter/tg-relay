@@ -266,10 +266,22 @@ Caveats:
 
 ### Antigravity (agy) relay
 
-Relays a Telegram channel to a running **Antigravity** session (Google's "agy" / Gemini CLI agentic IDE) instead of a Claude Code session. agy has no usable push channel (its MCP client ignores server-initiated notifications), so the bridge is driven entirely at the terminal layer — the same zellij keystroke-injection used by remote control, plus a transcript tailer for replies:
+Relays a Telegram channel to a running **Antigravity** session (Google's "agy" / Gemini CLI agentic IDE) instead of a Claude Code session. agy can't be woken by server push (its MCP client ignores server-initiated notifications), so **inbound is always driven at the terminal layer** — the same zellij keystroke-injection used by remote control. **Outbound has two modes** (config `outbound`, default `"mcp"`):
 
 - **Inbound** (Telegram → agy): your message is injected into the agy zellij pane (`write-chars` + Enter; multi-line messages go in via a bracketed-paste wrapper so embedded newlines don't submit early). Slash commands are passed through as prose — they're agy's own, not Claude's.
-- **Outbound** (agy → Telegram): the daemon tails the active conversation's transcript (`~/.gemini/antigravity-cli/brain/<conv-id>/.system_generated/logs/transcript_full.jsonl`) and relays each completed assistant turn (`source=MODEL ∧ type=PLANNER_RESPONSE ∧ status=DONE` with non-empty text). Tool steps (file reads, command runs, code edits, …) are **not** relayed.
+- **Outbound — `"mcp"` (default)**: agy sends its own replies by calling the `reply` MCP tool (the same `src/plugin.ts` that backs Claude Code), exactly like a Claude session. agy is *aware* of the bridge — it chooses when to message and can attach files. Requires a one-time setup (below) and that agy reliably calls the tool. Since agy's inbound arrived over zellij (no `chat_id`), the daemon defaults a `chat_id`-less reply to the channel's primary DM.
+- **Outbound — `"transcript"`**: the daemon tails the active conversation's transcript (`~/.gemini/antigravity-cli/brain/<conv-id>/.system_generated/logs/transcript_full.jsonl`) and relays each completed assistant turn (`source=MODEL ∧ type=PLANNER_RESPONSE ∧ status=DONE` with non-empty text); tool steps are not relayed. Zero agy cooperation and never misses, but agy is unaware (relays its narration, can't attach files). Use this if agy proves unreliable at calling the tool.
+
+**Setting up `"mcp"` outbound** (one time): register `src/plugin.ts` as an MCP server in agy's **global** config `~/.gemini/config/mcp_config.json` —
+
+```jsonc
+{ "mcpServers": { "tg-relay-telegram": {
+  "command": "/Users/you/.bun/bin/bun",
+  "args": ["/Users/you/Code/tg-relay/src/plugin.ts"]
+} } }
+```
+
+The plugin resolves which channel it belongs to from agy's working directory (its own cwd, then agy's via `lsof`), so an agy session in a project that has a `telegram-<project>` channel connects to that channel's daemon socket automatically. Then add a note to agy's `~/.gemini/GEMINI.md` telling it to call `reply` to message the user (its terminal output never reaches Telegram on its own). **MCP connects at session start, so start a fresh agy session after editing the config.**
 
 Opt in per channel by adding an `antigravity` block to `~/.claude/channels/telegram-<name>/access.json` (a channel is either agy-mode or normal Claude-mode — `antigravity` and `remoteControl` are independent):
 
@@ -281,7 +293,8 @@ Opt in per channel by adding an `antigravity` block to `~/.claude/channels/teleg
     "enabled": true,
     "zellijSession": "main",     // `zellij list-sessions`
     "zellijTab": "agy",          // optional; defaults to the channel name
-    "paneName": "agy"            // optional; zellij pane TITLE to pin (see below)
+    "paneName": "agy",           // optional; zellij pane TITLE to pin (see below)
+    "outbound": "mcp"            // "mcp" (default) or "transcript"
   }
 }
 ```

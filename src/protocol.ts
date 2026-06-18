@@ -58,7 +58,13 @@ export type DaemonToPlugin = InboundMessage | InboundPermissionRequest | Permiss
 
 export type OutboundReply = {
   type: 'reply'
-  chat_id: string
+  /**
+   * Target chat. Optional: a session that received its inbound out-of-band
+   * (e.g. the Antigravity adapter injects via zellij, so agy never sees a
+   * chat_id over MCP) may omit it, and the daemon defaults to the channel's
+   * primary DM. Claude Code always passes it through from the inbound message.
+   */
+  chat_id?: string
   text: string
   reply_to?: string
   files?: string[]
