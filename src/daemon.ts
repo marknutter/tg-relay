@@ -33,6 +33,13 @@ import { openPending, buildReplay, type PendingHandle } from './pending.js'
 import { runPollingLoop } from './polling.js'
 import { stopBotWithTimeout } from './shutdown.js'
 import { parseControlCommand, injectCommand, type RemoteControlConfig } from './remote-control.js'
+import {
+  type AntigravityConfig, type AntigravityState,
+  defaultBrainRoot, resolveActiveConversation, maxStepIndexInFile,
+  readNewTurns, isBusyByMtime, resolveAgyPane, injectAgyProse,
+  loadAntigravityState, saveAntigravityState,
+  normalizeOutboundMode, defaultReplyChatId,
+} from './antigravity.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -127,6 +134,7 @@ type Access = {
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   remoteControl?: RemoteControlConfig
+  antigravity?: AntigravityConfig
 }
 
 function defaultAccess(): Access {
@@ -149,6 +157,7 @@ function readAccessFile(stateDir: string): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       remoteControl: parsed.remoteControl,
+      antigravity: parsed.antigravity,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -365,6 +374,28 @@ type ChannelState = {
   pending: PendingHandle
   approvalTimer: ReturnType<typeof setInterval>
   heartbeats: Map<string, HeartbeatSchedule>
+  /**
+   * Antigravity (agy) adapter runtime, present only while the channel has
+   * `antigravity.enabled` in access.json. Started/stopped by
+   * reconcileAntigravity. See src/antigravity.ts and issue #74.
+   */
+  antigravity?: AntigravityRuntime
+}
+
+/** Live state for an agy-mode channel: outbound tailer + inbound inject queue. */
+type AgyQueueItem = { message: string; chatId: string; msgId?: number; queuedAt: number; noticed: boolean }
+type AntigravityRuntime = {
+  config: AntigravityConfig
+  state: AntigravityState
+  /** Inbound messages awaiting injection (FIFO), gated on agy being idle. */
+  queue: AgyQueueItem[]
+  /** ms timestamp of the last successful injection (post-inject busy cooldown). */
+  lastInjectAt: number
+  /** Last transcript mtime processed for outbound — skip reads when unchanged. */
+  lastMtimeMs: number
+  /** Reentrancy guard so overlapping async ticks can't double-inject. */
+  ticking: boolean
+  timer: ReturnType<typeof setInterval>
 }
 
 const channels = new Map<string, ChannelState>()
@@ -484,7 +515,12 @@ async function handlePluginMessage(
   try {
     switch (msg.type) {
       case 'reply': {
-        assertAllowedChat(state.config.stateDir, msg.chat_id)
+        // A reply may omit chat_id (the Antigravity adapter injects inbound via
+        // zellij, so agy never sees one over MCP) — default to the channel's
+        // primary DM. Claude always passes chat_id through from the inbound.
+        const chatId = defaultReplyChatId(msg.chat_id, readAccessFile(state.config.stateDir).allowFrom)
+        if (!chatId) throw new Error('reply has no chat_id and channel has no allowFrom default')
+        assertAllowedChat(state.config.stateDir, chatId)
         const reply_to = msg.reply_to != null ? Number(msg.reply_to) : undefined
 
         const files = msg.files ?? []
@@ -506,10 +542,10 @@ async function handlePluginMessage(
           const oggPath = await synthesizeVoice(msg.text, state.config.name)
           if (oggPath) {
             try {
-              await state.bot.api.sendVoice(msg.chat_id, new InputFile(oggPath), {
+              await state.bot.api.sendVoice(chatId, new InputFile(oggPath), {
                 ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
               })
-              log(state.config.name, `voice reply sent to chat ${msg.chat_id} (${msg.text.length} chars)`)
+              log(state.config.name, `voice reply sent to chat ${chatId} (${msg.text.length} chars)`)
               try { rmSync(oggPath, { force: true }) } catch {}
               break
             } catch (err) {
@@ -526,7 +562,7 @@ async function handlePluginMessage(
 
         for (let i = 0; i < chunks.length; i++) {
           const shouldReplyTo = reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
-          await state.bot.api.sendMessage(msg.chat_id, chunks[i], {
+          await state.bot.api.sendMessage(chatId, chunks[i], {
             ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
           })
         }
@@ -538,12 +574,12 @@ async function handlePluginMessage(
             ? { reply_parameters: { message_id: reply_to } }
             : undefined
           if (PHOTO_EXTS.has(ext)) {
-            await state.bot.api.sendPhoto(msg.chat_id, input, opts)
+            await state.bot.api.sendPhoto(chatId, input, opts)
           } else {
-            await state.bot.api.sendDocument(msg.chat_id, input, opts)
+            await state.bot.api.sendDocument(chatId, input, opts)
           }
         }
-        log(state.config.name, `reply sent to chat ${msg.chat_id}`)
+        log(state.config.name, `reply sent to chat ${chatId}`)
         break
       }
 
@@ -751,6 +787,16 @@ function setupInboundHandlers(state: ChannelState): void {
     const from = ctx.from!
     const chat_id = String(ctx.chat!.id)
     const msgId = ctx.message?.message_id
+
+    // Antigravity intercept (#74): agy-mode channels are not backed by a Claude
+    // session — every message is injected into the agy zellij pane and replies
+    // come back via the transcript tailer. Route here and return BEFORE the
+    // Claude-specific permission-reply / remote-control intercepts (slash
+    // commands are agy's own and should reach it as prose).
+    if (access.antigravity?.enabled && access.antigravity.zellijSession) {
+      await handleAgyInbound(state, text, chat_id, msgId)
+      return
+    }
 
     // Permission-reply intercept (text-form: "y abcde" / "n abcde").
     const permMatch = PERMISSION_REPLY_RE.exec(text)
@@ -1077,6 +1123,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   channels.set(config.name, state)
   setupInboundHandlers(state)
   reconcileHeartbeats(state)
+  reconcileAntigravity(state)
 
   // Start polling with retry logic. See src/polling.ts for the state
   // machine — 8 fast retries, then long-backoff (60s for 10min, 5min
@@ -1160,6 +1207,188 @@ function reconcileHeartbeats(state: ChannelState): void {
   }
 }
 
+// ── Antigravity (agy) adapter (#74) ─────────────────────────────────────────
+//
+// For channels with `antigravity.enabled`, a per-channel timer ticks every
+// AGY_TICK_MS doing two things: (1) outbound — tail the active agy conversation
+// transcript and relay each newly-completed assistant turn to Telegram; (2)
+// inbound — drain the inject queue (messages from Telegram) into the agy pane,
+// but only while agy looks idle. Idle is inferred from transcript write recency
+// (agy persists no RUNNING rows) plus a post-inject cooldown.
+
+const AGY_TICK_MS = parseInt(process.env.TG_RELAY_AGY_TICK_MS ?? '1500', 10)
+const AGY_BUSY_WINDOW_MS = parseInt(process.env.TG_RELAY_AGY_BUSY_WINDOW_MS ?? '4000', 10)
+const AGY_INJECT_COOLDOWN_MS = parseInt(process.env.TG_RELAY_AGY_INJECT_COOLDOWN_MS ?? '3000', 10)
+const AGY_QUEUE_NOTICE_MS = parseInt(process.env.TG_RELAY_AGY_QUEUE_NOTICE_MS ?? '60000', 10)
+
+function emoji(e: string): ReactionTypeEmoji['emoji'] {
+  return e as ReactionTypeEmoji['emoji']
+}
+
+/** Relay completed agy turns to the channel's primary DM, chunked like replies. */
+async function relayAgyTurns(state: ChannelState, turns: { stepIndex: number; content: string }[]): Promise<void> {
+  const access = readAccessFile(state.config.stateDir)
+  const chatId = access.allowFrom[0]
+  if (!chatId) {
+    log(state.config.name, `agy: ${turns.length} turn(s) not relayed (access.allowFrom empty)`)
+    return
+  }
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+  const mode = access.chunkMode ?? 'length'
+  for (const t of turns) {
+    for (const c of chunk(t.content, limit, mode)) {
+      try {
+        await state.bot.api.sendMessage(chatId, c)
+      } catch (err) {
+        log(state.config.name, `agy: relay send failed: ${err}`)
+      }
+    }
+    log(state.config.name, `agy: relayed turn step=${t.stepIndex} (${t.content.length} chars)`)
+  }
+}
+
+/** One adapter tick: outbound transcript relay, then inbound queue drain. */
+async function antigravityTick(state: ChannelState): Promise<void> {
+  const rt = state.antigravity
+  if (!rt || rt.ticking) return
+  rt.ticking = true
+  try {
+    const brainRoot = rt.config.brainRoot ?? defaultBrainRoot()
+    const active = resolveActiveConversation(brainRoot)
+    const outboundMode = normalizeOutboundMode(rt.config.outbound)
+
+    // Outbound: in "transcript" mode, follow the newest conversation and relay
+    // completed turns. In "mcp" mode the daemon relays nothing — agy sends its
+    // own replies via the reply MCP tool — but `active` is still resolved above
+    // because the inbound idle-gate uses the transcript's write recency.
+    if (active && outboundMode === 'transcript') {
+      if (active.convId !== rt.state.convId) {
+        // New/changed conversation: adopt at its tip so prior history isn't
+        // replayed; only turns produced from here on are relayed.
+        rt.state.convId = active.convId
+        rt.state.lastStepIndex = maxStepIndexInFile(active.transcriptPath)
+        rt.lastMtimeMs = active.mtimeMs
+        saveAntigravityState(state.config.stateDir, rt.state)
+        log(state.config.name, `agy: following conversation ${active.convId} from step ${rt.state.lastStepIndex}`)
+      } else if (active.mtimeMs !== rt.lastMtimeMs) {
+        rt.lastMtimeMs = active.mtimeMs
+        const { turns, watermark } = readNewTurns(active.transcriptPath, rt.state.lastStepIndex)
+        if (watermark !== rt.state.lastStepIndex) {
+          rt.state.lastStepIndex = watermark
+          saveAntigravityState(state.config.stateDir, rt.state)
+        }
+        if (turns.length > 0) await relayAgyTurns(state, turns)
+      }
+    }
+
+    // Inbound: inject the head of the queue once agy looks idle.
+    if (rt.queue.length > 0) {
+      const now = Date.now()
+      const mtime = active ? active.mtimeMs : null
+      const busy =
+        isBusyByMtime(mtime, now, AGY_BUSY_WINDOW_MS) || now - rt.lastInjectAt < AGY_INJECT_COOLDOWN_MS
+      if (!busy) {
+        const item = rt.queue[0]!
+        const tab = rt.config.zellijTab || state.config.name
+        const res = await injectAgyProse({ session: rt.config.zellijSession, tab, message: item.message, paneName: rt.config.paneName })
+        if (res.ok) {
+          rt.queue.shift()
+          rt.lastInjectAt = Date.now()
+          if (item.msgId != null) {
+            void state.bot.api.setMessageReaction(item.chatId, item.msgId, [{ type: 'emoji', emoji: emoji('✅') }]).catch(() => {})
+          }
+          log(state.config.name, `agy: injected queued message (${item.message.length} chars, ${rt.queue.length} left)`)
+        } else {
+          rt.queue.shift()
+          await state.bot.api.sendMessage(item.chatId, `⚠️ couldn't deliver to agy: ${res.error}`).catch(() => {})
+          log(state.config.name, `agy: inject failed, dropped message: ${res.error}`)
+        }
+      } else {
+        for (const item of rt.queue) {
+          if (!item.noticed && now - item.queuedAt > AGY_QUEUE_NOTICE_MS) {
+            item.noticed = true
+            void state.bot.api.sendMessage(item.chatId, '⏳ agy is busy — your message is queued and will be sent when it finishes.').catch(() => {})
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log(state.config.name, `agy: tick error: ${err}`)
+  } finally {
+    rt.ticking = false
+  }
+}
+
+/** Queue an inbound Telegram message for injection into the agy pane. */
+async function handleAgyInbound(
+  state: ChannelState,
+  text: string,
+  chatId: string,
+  msgId: number | undefined,
+): Promise<void> {
+  // Config may have been enabled since the last rescan — start lazily.
+  if (!state.antigravity) reconcileAntigravity(state)
+  const rt = state.antigravity
+  if (!rt) {
+    await state.bot.api.sendMessage(chatId, '⚠️ agy mode is enabled but failed to initialize.').catch(() => {})
+    return
+  }
+  const tab = rt.config.zellijTab || state.config.name
+  // Fail-safe: if the agy pane can't be resolved, reply and inject nothing.
+  const pane = resolveAgyPane(rt.config.zellijSession, tab, rt.config.paneName)
+  if (!pane.ok) {
+    await state.bot.api.sendMessage(chatId, `⚠️ couldn't reach agy: ${pane.error}`).catch(() => {})
+    log(state.config.name, `agy: pane unresolved, message rejected: ${pane.error}`)
+    return
+  }
+  rt.queue.push({ message: text, chatId, msgId, queuedAt: Date.now(), noticed: false })
+  if (msgId != null) {
+    void state.bot.api.setMessageReaction(chatId, msgId, [{ type: 'emoji', emoji: emoji('⏳') }]).catch(() => {})
+  }
+  log(state.config.name, `agy: queued inbound (${text.length} chars, queue=${rt.queue.length})`)
+}
+
+function startAntigravity(state: ChannelState, config: AntigravityConfig): void {
+  if (state.antigravity) return
+  const persisted = loadAntigravityState(state.config.stateDir)
+  const rt: AntigravityRuntime = {
+    config,
+    state: persisted,
+    queue: [],
+    lastInjectAt: 0,
+    lastMtimeMs: -1,
+    ticking: false,
+    timer: setInterval(() => { void antigravityTick(state) }, AGY_TICK_MS),
+  }
+  state.antigravity = rt
+  log(
+    state.config.name,
+    `agy: adapter started (session=${config.zellijSession}, tab=${config.zellijTab || state.config.name}, conv=${persisted.convId ?? 'none'}, step=${persisted.lastStepIndex})`,
+  )
+}
+
+function stopAntigravity(state: ChannelState): void {
+  const rt = state.antigravity
+  if (!rt) return
+  clearInterval(rt.timer)
+  state.antigravity = undefined
+  log(state.config.name, `agy: adapter stopped`)
+}
+
+/** Start/stop/update the agy adapter to match the channel's current access.json. */
+function reconcileAntigravity(state: ChannelState): void {
+  const access = readAccessFile(state.config.stateDir)
+  const cfg = access.antigravity
+  const enabled = !!(cfg?.enabled && cfg.zellijSession)
+  if (enabled && !state.antigravity) {
+    startAntigravity(state, cfg!)
+  } else if (!enabled && state.antigravity) {
+    stopAntigravity(state)
+  } else if (enabled && state.antigravity) {
+    state.antigravity.config = cfg! // apply session/tab/brainRoot changes in place
+  }
+}
+
 // ── Stop a single channel ───────────────────────────────────────────────────
 
 const CHANNEL_STOP_TIMEOUT_MS = parseInt(process.env.TG_RELAY_CHANNEL_STOP_TIMEOUT_MS ?? '4000', 10)
@@ -1169,6 +1398,7 @@ async function stopChannel(name: string): Promise<void> {
   if (!state) return
 
   clearInterval(state.approvalTimer)
+  stopAntigravity(state)
 
   // Cancel all heartbeat cron jobs so they don't fire on a stopped channel.
   for (const sched of state.heartbeats.values()) sched.job.stop()
@@ -1294,6 +1524,8 @@ function rescanChannels(): void {
     // Reload heartbeats for existing channels so config changes take effect
     // within the scan interval without a daemon restart.
     reconcileHeartbeats(state)
+    // Same for the agy adapter — enable/disable/retarget without a restart.
+    reconcileAntigravity(state)
   }
 }
 

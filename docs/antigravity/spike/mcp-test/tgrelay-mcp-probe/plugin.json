@@ -1,0 +1,5 @@
+{
+  "name": "tgrelay-mcp-probe",
+  "version": "0.0.1",
+  "description": "tg-relay test plugin: probes whether Antigravity loads MCP servers declared in a plugin. Read-only; one tool, logs to ~/.cache/tgrelay-mcp-probe."
+}

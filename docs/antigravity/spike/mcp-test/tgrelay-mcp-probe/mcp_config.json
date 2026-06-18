@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tgrelay-mcp-probe": {
+      "command": "/Users/marknutter/.bun/bin/bun",
+      "args": [
+        "/Users/marknutter/.gemini/antigravity-cli/plugins/tgrelay-mcp-probe/probe-server.ts"
+      ]
+    }
+  }
+}

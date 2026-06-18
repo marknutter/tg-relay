@@ -264,6 +264,55 @@ Caveats:
 - **Best when idle** — if the target session is mid-response when the command lands, the keystrokes may queue. Send control commands when the session is waiting on you.
 - Override the zellij binary path with `TG_RELAY_ZELLIJ` if it's not on the daemon's minimal launchd `PATH`.
 
+### Antigravity (agy) relay
+
+Relays a Telegram channel to a running **Antigravity** session (Google's "agy" / Gemini CLI agentic IDE) instead of a Claude Code session. agy can't be woken by server push (its MCP client ignores server-initiated notifications), so **inbound is always driven at the terminal layer** — the same zellij keystroke-injection used by remote control. **Outbound has two modes** (config `outbound`, default `"mcp"`):
+
+- **Inbound** (Telegram → agy): your message is injected into the agy zellij pane (`write-chars` + Enter; multi-line messages go in via a bracketed-paste wrapper so embedded newlines don't submit early). Slash commands are passed through as prose — they're agy's own, not Claude's.
+- **Outbound — `"mcp"` (default)**: agy sends its own replies by calling the `reply` MCP tool (the same `src/plugin.ts` that backs Claude Code), exactly like a Claude session. agy is *aware* of the bridge — it chooses when to message and can attach files. Requires a one-time setup (below) and that agy reliably calls the tool. Since agy's inbound arrived over zellij (no `chat_id`), the daemon defaults a `chat_id`-less reply to the channel's primary DM.
+- **Outbound — `"transcript"`**: the daemon tails the active conversation's transcript (`~/.gemini/antigravity-cli/brain/<conv-id>/.system_generated/logs/transcript_full.jsonl`) and relays each completed assistant turn (`source=MODEL ∧ type=PLANNER_RESPONSE ∧ status=DONE` with non-empty text); tool steps are not relayed. Zero agy cooperation and never misses, but agy is unaware (relays its narration, can't attach files). Use this if agy proves unreliable at calling the tool.
+
+**Setting up `"mcp"` outbound** (one time): register `src/plugin.ts` as an MCP server in agy's **global** config `~/.gemini/config/mcp_config.json` —
+
+```jsonc
+{ "mcpServers": { "tg-relay-telegram": {
+  "command": "/Users/you/.bun/bin/bun",
+  "args": ["/Users/you/Code/tg-relay/src/plugin.ts"]
+} } }
+```
+
+The plugin resolves which channel it belongs to from agy's working directory (its own cwd, then agy's via `lsof`), so an agy session in a project that has a `telegram-<project>` channel connects to that channel's daemon socket automatically. Then add a note to agy's `~/.gemini/GEMINI.md` telling it to call `reply` to message the user (its terminal output never reaches Telegram on its own). **MCP connects at session start, so start a fresh agy session after editing the config.**
+
+Opt in per channel by adding an `antigravity` block to `~/.claude/channels/telegram-<name>/access.json` (a channel is either agy-mode or normal Claude-mode — `antigravity` and `remoteControl` are independent):
+
+```jsonc
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["123456789"],
+  "antigravity": {
+    "enabled": true,
+    "zellijSession": "main",     // `zellij list-sessions`
+    "zellijTab": "agy",          // optional; defaults to the channel name
+    "paneName": "agy",           // optional; zellij pane TITLE to pin (see below)
+    "outbound": "mcp"            // "mcp" (default) or "transcript"
+  }
+}
+```
+
+**Pane targeting.** The daemon resolves the agy pane in the tab in order of confidence: (1) a terminal pane whose command is the **`agy`** binary; (2) failing that, a terminal pane whose zellij **title** equals `paneName`; (3) failing that, the **sole terminal pane** in the tab. If none of these identify a unique pane it replies with an error and injects nothing.
+
+Why the fallbacks: agy self-updates by hot-swapping its binary, which leaves the running process executing a renamed inode that **zellij can't read a command name for** (it reports the command as `-`), so the `agy`-command match silently misses. If agy runs in its own tab (one terminal pane), the sole-terminal fallback handles this with no config. If the tab has multiple terminal panes, rename the agy pane in zellij and set `paneName` to match. ⚠️ The sole-terminal fallback means that if agy has exited and a shell is the only pane left, your message would be typed into that shell — keep agy in a dedicated tab.
+
+> **Conversation scope is global.** agy stores all conversations under one brain root with no reliable per-project marker, so the daemon follows the single most-recently-active agy conversation across *all* projects. This is correct for one agy session at a time (the common case); running multiple agy sessions concurrently can cross wires.
+
+**Turn-gating.** agy's transcript only persists *completed* steps (no in-progress markers), so the daemon infers "busy vs idle" from how recently the transcript was written, plus a short cooldown after each injection. A message that arrives while agy is mid-turn is **queued** (you get a ⏳ reaction) and injected once agy goes idle (then ✅). If agy stays busy past `TG_RELAY_AGY_QUEUE_NOTICE_MS`, you get a one-time "still queued" note; messages are never dropped or injected mid-response.
+
+**Conversation tracking.** The daemon follows the most-recently-written `brain/<conv-id>` automatically; starting a new agy conversation just switches the followed transcript. The last-relayed `step_index` is persisted per channel (`antigravity-state.json`), so a daemon restart resumes without replaying old turns or dropping ones that completed during downtime. On first attach to a conversation it starts from the tip — it does not replay pre-existing history.
+
+> ⚠️ **Trust model.** Inbound here is *arbitrary prose into a code-executing agent* — broader than remote control's locked command allowlist. That's you driving your own agent (same as typing into agy directly), gated by the channel's access allowlist. Control characters are stripped from messages so they can't smuggle escape sequences into the terminal.
+>
+> ⚠️ **Brittleness.** Outbound rides on Gemini's internal transcript format, verified on **agy 1.0.6**. Re-verify after agy updates.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -276,6 +325,12 @@ Caveats:
 | `TG_RELAY_SHUTDOWN_TIMEOUT_MS` | Global daemon-shutdown deadline. Must be less than the plist's `ExitTimeOut` (15s) so the runtime exits before launchd resorts to `SIGKILL`. Exceeding this logs a warning and exits anyway. | `10000` |
 | `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
 | `TG_RELAY_ZELLIJ` | Absolute path to the `zellij` binary for remote-control keystroke injection. Resolved from common locations / login shell if unset. | _(auto-detected)_ |
+| `TG_RELAY_AGY_BRAIN_ROOT` | Root dir holding agy's per-conversation `<conv-id>/…/transcript_full.jsonl` brains (Antigravity relay). | `~/.gemini/antigravity-cli/brain` |
+| `TG_RELAY_AGY_BINARY` | Command basename that identifies the agy pane during pane resolution. | `agy` |
+| `TG_RELAY_AGY_TICK_MS` | Antigravity adapter poll interval — outbound transcript relay + inbound queue drain. | `1500` |
+| `TG_RELAY_AGY_BUSY_WINDOW_MS` | agy is treated as mid-turn (inbound queued) if its transcript was written within this window. | `4000` |
+| `TG_RELAY_AGY_INJECT_COOLDOWN_MS` | After injecting a queued message, treat agy as busy for this long before injecting the next. | `3000` |
+| `TG_RELAY_AGY_QUEUE_NOTICE_MS` | If a queued inbound message waits longer than this, send a one-time "agy still busy" notice. | `60000` |
 
 ## Development
 

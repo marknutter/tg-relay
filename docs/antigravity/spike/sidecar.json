@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "command": "bash",
+  "args": ["echo-sidecar.sh"],
+  "restart_policy": "never",
+  "description": "tg-relay spike: capture injected ANTIGRAVITY_* env to prove the sidecar integration seam is open. Read-only; makes no agentapi calls."
+}

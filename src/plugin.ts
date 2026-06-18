@@ -225,7 +225,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, files (absolute paths) to attach images or documents, or voice:true to synthesize the text as a voice note using the channel\'s cloned voice.',
+        'Reply on Telegram. Pass chat_id from the inbound message when you have one; if omitted it defaults to this channel\'s primary chat (useful when the inbound message did not arrive over MCP). Optionally pass reply_to (message_id) for threading, files (absolute paths) to attach images or documents, or voice:true to synthesize the text as a voice note using the channel\'s cloned voice.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -245,7 +245,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'If true, synthesize text as a voice note via the TTS sidecar. Use for short conversational replies when the user sent voice, or when explicitly asked to speak. Never use for code, URLs, file paths, long technical detail, lists, or replies over ~150 words. Falls back to text if sidecar unavailable or voice synthesis fails.',
           },
         },
-        required: ['chat_id', 'text'],
+        required: ['text'],
       },
     },
     {
@@ -308,7 +308,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply': {
-        const chat_id = args.chat_id as string
+        const chat_id = args.chat_id as string | undefined
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
@@ -324,7 +324,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const msg: OutboundReply = {
           type: 'reply',
-          chat_id,
+          ...(chat_id ? { chat_id } : {}),
           text,
           ...(reply_to ? { reply_to } : {}),
           ...(files.length > 0 ? { files } : {}),

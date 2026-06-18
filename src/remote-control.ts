@@ -297,11 +297,15 @@ export function parseListPanes(output: string): PaneInfo[] {
   return panes
 }
 
-/** True when a pane's command is the `claude` binary (any path / args). */
-function isClaudeCommand(command: string): boolean {
+/** Basename of a pane's command (first token, path stripped). */
+export function commandBasename(command: string): string {
   const first = command.trim().split(/\s+/)[0] ?? ''
-  const base = first.split('/').pop() ?? first
-  return base === 'claude'
+  return first.split('/').pop() ?? first
+}
+
+/** True when a pane's command's basename matches `binary` (any path / args). */
+export function matchesBinary(command: string, binary: string): boolean {
+  return commandBasename(command) === binary
 }
 
 export type PaneResolution = { ok: true; paneId: string } | { ok: false; error: string }
@@ -311,19 +315,23 @@ export type PaneResolution = { ok: true; paneId: string } | { ok: false; error: 
  * is `claude`. Fails (rather than guessing) when the tab is missing or has no
  * Claude pane — we never type into a pane we can't confirm is Claude.
  *
- * When a tab holds several Claude panes, disambiguate by, in order: a pane
+ * When a tab holds several matching panes, disambiguate by, in order: a pane
  * explicitly named `paneName` (default "Claude Code" — rename the pane in
  * zellij to pin it), then the focused one, then the first.
+ *
+ * `binary` is the command basename to match (default "claude"); the
+ * Antigravity adapter passes "agy" to reuse this resolver unchanged.
  */
 export function resolveTargetPane(
   panes: PaneInfo[],
-  opts: { tab: string; paneName?: string },
+  opts: { tab: string; paneName?: string; binary?: string },
 ): PaneResolution {
   const paneName = opts.paneName ?? DEFAULT_PANE_NAME
+  const binary = opts.binary ?? 'claude'
   const inTab = panes.filter((p) => p.tabName === opts.tab && p.type === 'terminal')
   if (inTab.length === 0) return { ok: false, error: `no terminal panes found in zellij tab "${opts.tab}"` }
-  const claude = inTab.filter((p) => isClaudeCommand(p.command))
-  if (claude.length === 0) return { ok: false, error: `no Claude pane found in zellij tab "${opts.tab}"` }
+  const claude = inTab.filter((p) => matchesBinary(p.command, binary))
+  if (claude.length === 0) return { ok: false, error: `no ${binary} pane found in zellij tab "${opts.tab}"` }
   if (claude.length === 1) return { ok: true, paneId: claude[0]!.paneId }
   // Ambiguous: prefer an explicitly-named pane, then the focused one, then first.
   const named = claude.find((p) => p.title === paneName)
