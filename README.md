@@ -280,12 +280,17 @@ Opt in per channel by adding an `antigravity` block to `~/.claude/channels/teleg
   "antigravity": {
     "enabled": true,
     "zellijSession": "main",     // `zellij list-sessions`
-    "zellijTab": "agy"           // optional; defaults to the channel name
+    "zellijTab": "agy",          // optional; defaults to the channel name
+    "paneName": "agy"            // optional; zellij pane TITLE to pin (see below)
   }
 }
 ```
 
-**Pane targeting** works exactly like remote control, but matches the pane whose command is the **`agy`** binary. If it can't resolve an agy pane in the tab, it replies with an error and injects nothing.
+**Pane targeting.** The daemon resolves the agy pane in the tab in order of confidence: (1) a terminal pane whose command is the **`agy`** binary; (2) failing that, a terminal pane whose zellij **title** equals `paneName`; (3) failing that, the **sole terminal pane** in the tab. If none of these identify a unique pane it replies with an error and injects nothing.
+
+Why the fallbacks: agy self-updates by hot-swapping its binary, which leaves the running process executing a renamed inode that **zellij can't read a command name for** (it reports the command as `-`), so the `agy`-command match silently misses. If agy runs in its own tab (one terminal pane), the sole-terminal fallback handles this with no config. If the tab has multiple terminal panes, rename the agy pane in zellij and set `paneName` to match. ⚠️ The sole-terminal fallback means that if agy has exited and a shell is the only pane left, your message would be typed into that shell — keep agy in a dedicated tab.
+
+> **Conversation scope is global.** agy stores all conversations under one brain root with no reliable per-project marker, so the daemon follows the single most-recently-active agy conversation across *all* projects. This is correct for one agy session at a time (the common case); running multiple agy sessions concurrently can cross wires.
 
 **Turn-gating.** agy's transcript only persists *completed* steps (no in-progress markers), so the daemon infers "busy vs idle" from how recently the transcript was written, plus a short cooldown after each injection. A message that arrives while agy is mid-turn is **queued** (you get a ⏳ reaction) and injected once agy goes idle (then ✅). If agy stays busy past `TG_RELAY_AGY_QUEUE_NOTICE_MS`, you get a one-time "still queued" note; messages are never dropped or injected mid-response.
 

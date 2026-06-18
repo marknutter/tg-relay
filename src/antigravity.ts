@@ -46,8 +46,8 @@ import { join } from 'node:path'
 import {
   resolveZellij,
   parseListPanes,
-  resolveTargetPane,
-  type PaneResolution,
+  matchesBinary,
+  type PaneInfo,
 } from './remote-control.js'
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -60,6 +60,14 @@ export type AntigravityConfig = {
   zellijSession: string
   /** zellij tab name the agy pane lives in (defaults to the channel name). */
   zellijTab?: string
+  /**
+   * Optional zellij pane TITLE that pins the agy pane. agy's binary is often
+   * hot-swapped by self-update, which leaves the running process executing a
+   * renamed inode that zellij can't resolve a command name for (it reports
+   * "-"). When that happens we can't match the pane by its `agy` command, so
+   * rename the pane in zellij and set this to target it by title instead.
+   */
+  paneName?: string
   /**
    * Override the brain root that holds `<conv-id>/…/transcript_full.jsonl`.
    * Defaults to ~/.gemini/antigravity-cli/brain. Mainly for tests.
@@ -291,12 +299,60 @@ export function needsBracketedPaste(message: string): boolean {
   return message.includes('\n')
 }
 
+export type AgyPaneResolution =
+  | { ok: true; paneId: string; via: 'command' | 'title' | 'sole-terminal' }
+  | { ok: false; error: string }
+
+/**
+ * Resolve the agy pane within `tab`, in order of confidence:
+ *   1. command — a terminal pane whose command basename is `agy` (most
+ *      reliable, but zellij can't always read it: a self-updated agy runs a
+ *      renamed inode and zellij reports the command as "-").
+ *   2. title — a terminal pane whose zellij title equals `paneName` (titles are
+ *      zellij-managed, so they survive the command-detection failure above).
+ *   3. sole-terminal — if the tab has exactly one terminal pane, use it (a
+ *      dedicated agy tab is unambiguous; there's only one place to type).
+ * Fails (typing nothing) when none of these identify a unique pane. NOTE: the
+ * sole-terminal fallback means that if agy has exited and a shell is the only
+ * pane, prose would be typed into that shell — run agy in its own tab.
+ */
+export function resolveAgyPaneFromList(
+  panes: PaneInfo[],
+  opts: { tab: string; paneName?: string },
+): AgyPaneResolution {
+  const inTab = panes.filter((p) => p.tabName === opts.tab && p.type === 'terminal')
+  if (inTab.length === 0) return { ok: false, error: `no terminal panes found in zellij tab "${opts.tab}"` }
+
+  const byCmd = inTab.filter((p) => matchesBinary(p.command, AGY_BINARY))
+  if (byCmd.length >= 1) {
+    if (byCmd.length === 1) return { ok: true, paneId: byCmd[0]!.paneId, via: 'command' }
+    const named = opts.paneName ? byCmd.find((p) => p.title === opts.paneName) : undefined
+    const focused = byCmd.find((p) => p.focused)
+    return { ok: true, paneId: (named ?? focused ?? byCmd[0]!).paneId, via: 'command' }
+  }
+
+  if (opts.paneName) {
+    const byTitle = inTab.filter((p) => p.title === opts.paneName)
+    if (byTitle.length === 1) return { ok: true, paneId: byTitle[0]!.paneId, via: 'title' }
+    if (byTitle.length > 1) {
+      return { ok: false, error: `multiple panes titled "${opts.paneName}" in zellij tab "${opts.tab}"` }
+    }
+  }
+
+  if (inTab.length === 1) return { ok: true, paneId: inTab[0]!.paneId, via: 'sole-terminal' }
+
+  return {
+    ok: false,
+    error: `couldn't identify the agy pane in zellij tab "${opts.tab}" (zellij reports no \`agy\` command); rename the agy pane and set antigravity.paneName, or run agy in its own tab`,
+  }
+}
+
 /**
  * Resolve the agy pane in `tab` of `session` without typing into it. Used at
  * inbound time so we can reply with an error and inject nothing when the pane
  * can't be found (fail-safe, as in remote-control).
  */
-export function resolveAgyPane(session: string, tab: string): PaneResolution {
+export function resolveAgyPane(session: string, tab: string, paneName?: string): AgyPaneResolution {
   const zellij = resolveZellij()
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
   try {
@@ -304,7 +360,7 @@ export function resolveAgyPane(session: string, tab: string): PaneResolution {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    return resolveTargetPane(parseListPanes(out), { tab, binary: AGY_BINARY })
+    return resolveAgyPaneFromList(parseListPanes(out), { tab, paneName })
   } catch (err) {
     return { ok: false, error: zellijError(err, 'list-panes') }
   }
@@ -321,6 +377,7 @@ export async function injectAgyProse(opts: {
   session: string
   tab: string
   message: string
+  paneName?: string
 }): Promise<InjectResult> {
   const zellij = resolveZellij()
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
@@ -336,7 +393,7 @@ export async function injectAgyProse(opts: {
     return { ok: false, error: zellijError(err, 'list-panes') }
   }
 
-  const resolved = resolveTargetPane(parseListPanes(panesOut), { tab: opts.tab, binary: AGY_BINARY })
+  const resolved = resolveAgyPaneFromList(parseListPanes(panesOut), { tab: opts.tab, paneName: opts.paneName })
   if (!resolved.ok) return { ok: false, error: resolved.error }
   const paneId = resolved.paneId
 

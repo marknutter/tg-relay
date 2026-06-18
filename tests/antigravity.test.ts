@@ -46,10 +46,11 @@ import {
   saveAntigravityState,
   injectAgyProse,
   resolveAgyPane,
+  resolveAgyPaneFromList,
   type AgyRecord,
   type AntigravityState,
 } from '../src/antigravity.js'
-import { _resetZellijCache } from '../src/remote-control.js'
+import { _resetZellijCache, type PaneInfo } from '../src/remote-control.js'
 
 const FIXTURE = join(import.meta.dir, 'fixtures', 'agy-transcript.jsonl')
 
@@ -899,5 +900,278 @@ describe('agy pane injection', () => {
     })
     expect(result.ok).toBe(false)
     if (!result.ok) expect(typeof result.error).toBe('string')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════
+//  resolveAgyPaneFromList — pure pane-resolution logic (black-box vs SPEC)
+// ════════════════════════════════════════════════════════════════════════
+
+describe('resolveAgyPaneFromList', () => {
+  // Builds a PaneInfo with sensible defaults, overridable per-field.
+  function pane(overrides: Partial<PaneInfo> = {}): PaneInfo {
+    return {
+      tabName: 'sbook',
+      paneId: 'terminal_0',
+      type: 'terminal',
+      title: 'Pane #1',
+      command: '/bin/zsh',
+      cwd: '/tmp',
+      focused: false,
+      ...overrides,
+    }
+  }
+
+  // ─── (1) no terminal panes in the tab ──────────────────────────────────
+
+  test('no panes at all → ok:false, error mentions "no terminal panes" + tab', () => {
+    const r = resolveAgyPaneFromList([], { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error).toContain('no terminal panes')
+      expect(r.error).toContain('sbook')
+    }
+  })
+
+  test('tab has only plugin panes → ok:false "no terminal panes"', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'plugin_0', type: 'plugin', title: 'zellij:tab-bar', command: '' }),
+      pane({ tabName: 'sbook', paneId: 'plugin_1', type: 'plugin', title: 'zellij:status-bar', command: '' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain('no terminal panes')
+  })
+
+  test('requested tab does not exist (terminals live in another tab) → "no terminal panes"', () => {
+    const panes = [
+      pane({ tabName: 'other', paneId: 'terminal_5', command: 'agy --resume z' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error).toContain('no terminal panes')
+      expect(r.error).toContain('sbook')
+    }
+  })
+
+  // ─── (2) command-match: single ─────────────────────────────────────────
+
+  test('single agy command-match among shell/nvim/claude panes → via:command', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Editor', command: 'nvim src/x.ts' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_3', title: 'Claude', command: 'claude --resume abc' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_4', title: 'Agent', command: 'agy' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_4')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  test('command-match recognizes a full path + args command string', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', command: '/bin/zsh' }),
+      pane({
+        tabName: 'sbook',
+        paneId: 'terminal_9',
+        title: 'Agent',
+        command: '/Users/x/.local/bin/agy --dangerously-skip-permissions',
+      }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_9')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  test('command basename match only — "agybar" / "legacy-agy" must NOT match', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', command: 'agybar --x' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', command: '/usr/bin/legacy-agy' }),
+    ]
+    // Neither is an agy command-match; no paneName; two terminals → couldn't identify.
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("couldn't identify")
+  })
+
+  // ─── (2) command-match: multiple → disambiguation, still via:command ───
+
+  test('multiple agy matches, paneName given → disambiguate by title (via:command)', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'agy-one', command: 'agy', focused: true }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'agy-two', command: '/Users/x/.local/bin/agy --flag' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_3', title: 'agy-three', command: 'agy --resume q' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'agy-two' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_2')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  test('multiple agy matches, no paneName → disambiguate by focused (via:command)', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'a', command: 'agy' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'b', command: 'agy --flag', focused: true }),
+      pane({ tabName: 'sbook', paneId: 'terminal_3', title: 'c', command: 'agy' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_2')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  test('multiple agy matches, no paneName, none focused → first match (via:command)', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_7', title: 'a', command: 'agy' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_8', title: 'b', command: 'agy --flag' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_7')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  test('multiple agy matches, paneName given but matches none → falls back to focused (still via:command)', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'a', command: 'agy' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'b', command: 'agy', focused: true }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'no-such-title' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_2')
+      expect(r.via).toBe('command')
+    }
+  })
+
+  // ─── (3) title-match (no command-match) ────────────────────────────────
+
+  test('no agy command + paneName matches exactly one title → via:title', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Agent', command: '-' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_3', title: 'Claude', command: 'claude' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'Agent' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_2')
+      expect(r.via).toBe('title')
+    }
+  })
+
+  test('no agy command + paneName matches two panes → ok:false "multiple panes titled"', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Agent', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Agent', command: '-' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_3', title: 'Other', command: 'claude' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'Agent' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain('multiple panes titled')
+  })
+
+  // ─── (4) sole-terminal fallback ────────────────────────────────────────
+
+  test('no agy command + no paneName + exactly one terminal (command "-") → via:sole-terminal', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Mystery', command: '-' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_1')
+      expect(r.via).toBe('sole-terminal')
+    }
+  })
+
+  test('one terminal (command "/bin/zsh") + two plugin panes → via:sole-terminal (plugins ignored)', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'plugin_0', type: 'plugin', title: 'zellij:tab-bar', command: '' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Mystery', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'plugin_1', type: 'plugin', title: 'zellij:status-bar', command: '' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_1')
+      expect(r.via).toBe('sole-terminal')
+    }
+  })
+
+  test('sole-terminal also applies when paneName is given but matches no title', () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Mystery', command: '-' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'no-match' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_1')
+      expect(r.via).toBe('sole-terminal')
+    }
+  })
+
+  // ─── (5) couldn't identify ─────────────────────────────────────────────
+
+  test("no agy command + no paneName + two terminal panes → ok:false \"couldn't identify\"", () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Claude', command: 'claude --resume abc' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("couldn't identify")
+  })
+
+  test("no agy command + paneName matches nothing + two terminals → \"couldn't identify\"", () => {
+    const panes = [
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Claude', command: 'claude' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook', paneName: 'no-such' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("couldn't identify")
+  })
+
+  // ─── cross-tab isolation ───────────────────────────────────────────────
+
+  test('an agy pane in a DIFFERENT tab does not satisfy the request', () => {
+    const panes = [
+      pane({ tabName: 'other', paneId: 'terminal_9', title: 'Agent', command: 'agy --resume z' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_2', title: 'Claude', command: 'claude' }),
+    ]
+    // sbook has two non-agy terminals → couldn't identify (the other-tab agy is ignored).
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("couldn't identify")
+  })
+
+  test('plugin panes in other tabs do not inflate the sole-terminal count', () => {
+    const panes = [
+      pane({ tabName: 'other', paneId: 'terminal_5', title: 'Agent', command: 'agy' }),
+      pane({ tabName: 'other', paneId: 'terminal_6', title: 'Shell', command: '/bin/zsh' }),
+      pane({ tabName: 'sbook', paneId: 'plugin_0', type: 'plugin', title: 'zellij:tab-bar', command: '' }),
+      pane({ tabName: 'sbook', paneId: 'terminal_1', title: 'Mystery', command: '/bin/zsh' }),
+    ]
+    const r = resolveAgyPaneFromList(panes, { tab: 'sbook' })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.paneId).toBe('terminal_1')
+      expect(r.via).toBe('sole-terminal')
+    }
   })
 })

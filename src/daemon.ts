@@ -1280,7 +1280,7 @@ async function antigravityTick(state: ChannelState): Promise<void> {
       if (!busy) {
         const item = rt.queue[0]!
         const tab = rt.config.zellijTab || state.config.name
-        const res = await injectAgyProse({ session: rt.config.zellijSession, tab, message: item.message })
+        const res = await injectAgyProse({ session: rt.config.zellijSession, tab, message: item.message, paneName: rt.config.paneName })
         if (res.ok) {
           rt.queue.shift()
           rt.lastInjectAt = Date.now()
@@ -1325,7 +1325,7 @@ async function handleAgyInbound(
   }
   const tab = rt.config.zellijTab || state.config.name
   // Fail-safe: if the agy pane can't be resolved, reply and inject nothing.
-  const pane = resolveAgyPane(rt.config.zellijSession, tab)
+  const pane = resolveAgyPane(rt.config.zellijSession, tab, rt.config.paneName)
   if (!pane.ok) {
     await state.bot.api.sendMessage(chatId, `⚠️ couldn't reach agy: ${pane.error}`).catch(() => {})
     log(state.config.name, `agy: pane unresolved, message rejected: ${pane.error}`)
