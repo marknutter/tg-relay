@@ -34,6 +34,15 @@ import { runPollingLoop } from './polling.js'
 import { stopBotWithTimeout } from './shutdown.js'
 import { parseControlCommand, injectCommand, type RemoteControlConfig } from './remote-control.js'
 import {
+  advanceHaltState,
+  initialHaltState,
+  readPaneScreen,
+  injectClaudeText,
+  HALT_TICK_MS,
+  HALT_PERSIST_TICKS,
+  type HaltState,
+} from './halt-watch.js'
+import {
   type AntigravityConfig, type AntigravityState,
   defaultBrainRoot, resolveActiveConversation, maxStepIndexInFile,
   readNewTurns, isBusyByMtime, resolveAgyPane, injectAgyProse,
@@ -380,6 +389,20 @@ type ChannelState = {
    * reconcileAntigravity. See src/antigravity.ts and issue #74.
    */
   antigravity?: AntigravityRuntime
+  /**
+   * Halt-watcher runtime (issue #79), present only while the channel has
+   * remote-control enabled with halt-watching on. Polls the Claude pane and
+   * alerts over Telegram when the session stalls on a rate-limit error.
+   */
+  haltWatch?: HaltWatchRuntime
+}
+
+/** Live state for a halt-watched channel: episode state + polling timer. */
+type HaltWatchRuntime = {
+  state: HaltState
+  /** Reentrancy guard so a slow dump-screen can't overlap the next tick. */
+  ticking: boolean
+  timer: ReturnType<typeof setInterval>
 }
 
 /** Live state for an agy-mode channel: outbound tailer + inbound inject queue. */
@@ -854,6 +877,32 @@ function setupInboundHandlers(state: ChannelState): void {
       // parsed.kind === 'not-command' → fall through to normal handling.
     }
 
+    // Halt resume (#79): if the watcher alerted that this session stalled on a
+    // rate limit, inject the user's next message into the Claude pane as
+    // keystrokes (the MCP path may not wake a halted session) and do NOT also
+    // forward it over the socket — that would double-deliver. Slash commands
+    // are handled above, so a command sent during a halt still runs normally.
+    const hw = state.haltWatch
+    if (hw?.state.awaitingResume && rc?.enabled && rc.zellijSession) {
+      const tab = rc.zellijTab || channelName
+      // Re-arm before injecting: if the session is still stuck afterward, the
+      // watcher should be free to detect it and alert again.
+      hw.state = { ...hw.state, awaitingResume: false, alerted: false, stableHaltTicks: 0 }
+      const res = await injectClaudeText({ session: rc.zellijSession, tab, text })
+      if (res.ok) {
+        if (msgId != null) {
+          void bot.api.setMessageReaction(chat_id, msgId, [
+            { type: 'emoji', emoji: '✅' as ReactionTypeEmoji['emoji'] },
+          ]).catch(() => {})
+        }
+        log(channelName, `halt-watch: injected resume into ${rc.zellijSession}:${tab}`)
+      } else {
+        await bot.api.sendMessage(chat_id, `⚠️ couldn't resume session: ${res.error}`).catch(() => {})
+        log(channelName, `halt-watch: resume inject failed: ${res.error}`)
+      }
+      return
+    }
+
     // Typing indicator
     void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
 
@@ -1124,6 +1173,7 @@ async function startChannel(config: ChannelConfig): Promise<void> {
   setupInboundHandlers(state)
   reconcileHeartbeats(state)
   reconcileAntigravity(state)
+  reconcileHaltWatch(state)
 
   // Start polling with retry logic. See src/polling.ts for the state
   // machine — 8 fast retries, then long-backoff (60s for 10min, 5min
@@ -1389,6 +1439,77 @@ function reconcileAntigravity(state: ChannelState): void {
   }
 }
 
+// ── Halt-watcher (#79) ──────────────────────────────────────────────────────
+//
+// For channels with remote-control enabled and halt-watching on, a per-channel
+// timer polls the Claude pane every HALT_TICK_MS. When the pane shows a
+// persistent API rate-limit halt, we push exactly ONE Telegram alert per
+// episode so the user knows to reply. The reply is injected into the pane via
+// zellij (see the awaitingResume handling in handleInbound), not the MCP path,
+// which may not wake a halted session. Notify-only — we never auto-continue.
+
+function haltWatchEnabled(rc: RemoteControlConfig | undefined): rc is RemoteControlConfig {
+  return !!(rc?.enabled && rc.zellijSession && rc.haltWatch !== false)
+}
+
+async function haltWatchTick(state: ChannelState): Promise<void> {
+  const rt = state.haltWatch
+  if (!rt || rt.ticking) return
+  const access = readAccessFile(state.config.stateDir)
+  const rc = access.remoteControl
+  if (!haltWatchEnabled(rc)) return // disabled live; reconcile tears the timer down
+
+  rt.ticking = true
+  try {
+    const tab = rc.zellijTab || state.config.name
+    const read = readPaneScreen(rc.zellijSession, tab)
+    if (!read.ok) return // pane not resolvable this tick — leave episode state untouched
+
+    const { state: next, shouldAlert } = advanceHaltState(rt.state, read.screen, HALT_PERSIST_TICKS)
+    rt.state = next
+    if (!shouldAlert) return
+
+    const chatId = access.allowFrom[0]
+    if (!chatId) {
+      log(state.config.name, `halt-watch: session halted but access.allowFrom is empty — no one to alert`)
+      return
+    }
+    await state.bot.api.sendMessage(
+      chatId,
+      `⚠️ ${state.config.name} session halted — API rate limit (server-side, not your usage). Reply here to resume (e.g. "continue").`,
+    ).catch(() => {})
+    log(state.config.name, `halt-watch: alerted ${chatId} (session halted on rate limit)`)
+  } finally {
+    rt.ticking = false
+  }
+}
+
+function startHaltWatch(state: ChannelState): void {
+  if (state.haltWatch) return
+  state.haltWatch = {
+    state: initialHaltState(),
+    ticking: false,
+    timer: setInterval(() => { void haltWatchTick(state) }, HALT_TICK_MS),
+  }
+  log(state.config.name, `halt-watch: started (tick=${HALT_TICK_MS}ms, persist=${HALT_PERSIST_TICKS})`)
+}
+
+function stopHaltWatch(state: ChannelState): void {
+  const rt = state.haltWatch
+  if (!rt) return
+  clearInterval(rt.timer)
+  state.haltWatch = undefined
+  log(state.config.name, `halt-watch: stopped`)
+}
+
+/** Start/stop the halt-watcher to match the channel's current access.json. */
+function reconcileHaltWatch(state: ChannelState): void {
+  const access = readAccessFile(state.config.stateDir)
+  const enabled = haltWatchEnabled(access.remoteControl)
+  if (enabled && !state.haltWatch) startHaltWatch(state)
+  else if (!enabled && state.haltWatch) stopHaltWatch(state)
+}
+
 // ── Stop a single channel ───────────────────────────────────────────────────
 
 const CHANNEL_STOP_TIMEOUT_MS = parseInt(process.env.TG_RELAY_CHANNEL_STOP_TIMEOUT_MS ?? '4000', 10)
@@ -1399,6 +1520,7 @@ async function stopChannel(name: string): Promise<void> {
 
   clearInterval(state.approvalTimer)
   stopAntigravity(state)
+  stopHaltWatch(state)
 
   // Cancel all heartbeat cron jobs so they don't fire on a stopped channel.
   for (const sched of state.heartbeats.values()) sched.job.stop()
@@ -1526,6 +1648,8 @@ function rescanChannels(): void {
     reconcileHeartbeats(state)
     // Same for the agy adapter — enable/disable/retarget without a restart.
     reconcileAntigravity(state)
+    // Same for the halt-watcher — enable/disable without a restart.
+    reconcileHaltWatch(state)
   }
 }
 
