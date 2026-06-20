@@ -264,6 +264,29 @@ Caveats:
 - **Best when idle** — if the target session is mid-response when the command lands, the keystrokes may queue. Send control commands when the session is waiting on you.
 - Override the zellij binary path with `TG_RELAY_ZELLIJ` if it's not on the daemon's minimal launchd `PATH`.
 
+### Halt alerts (rate-limit stalls)
+
+When a Claude Code session hits a transient server-side rate limit, it halts mid-turn and renders an error in the TUI — `API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited` — then sits idle until someone types `continue`. This happens at the API layer, so nothing flows through the MCP plugin and the relay never sees it: away from your desk, you have no idea work has stalled.
+
+Halt-watching closes that gap. For any channel with `remoteControl` enabled, the daemon polls the Claude pane (the same `dump-screen` it uses for `/model` confirmations) and pushes **one Telegram alert per stall** so you know to reply. Your reply is **injected into the pane as keystrokes** (not the MCP path, which may not wake a halted session) — so you can just answer the alert with `continue` and the session picks back up.
+
+It's **on by default wherever remote control is on** — no extra config. Opt out per channel:
+
+```jsonc
+"remoteControl": {
+  "enabled": true,
+  "zellijSession": "main",
+  "zellijTab": "tg-relay",
+  "haltWatch": false          // disable rate-limit alerts for this channel
+}
+```
+
+Design notes:
+- **Notify-only** — the daemon never auto-continues. These are transient server overloads where blindly re-firing `continue` can make the limit worse; you stay in control.
+- **No false alarms** — Claude Code often auto-recovers from these errors by retrying internally. An alert fires only when the error signature persists on an **unchanged** pane screen for `TG_RELAY_HALT_PERSIST_TICKS` consecutive polls (default 2), i.e. the session is genuinely stuck — not mid-retry and not the words merely scrolling past.
+- **One alert per episode** — no repeat spam while the same error sits on screen; once the session moves again (or clears), the watcher re-arms for the next stall.
+- Tunables: `TG_RELAY_HALT_TICK_MS` (poll interval, default 15000) and `TG_RELAY_HALT_PERSIST_TICKS` (default 2).
+
 ### Antigravity (agy) relay
 
 Relays a Telegram channel to a running **Antigravity** session (Google's "agy" / Gemini CLI agentic IDE) instead of a Claude Code session. agy can't be woken by server push (its MCP client ignores server-initiated notifications), so **inbound is always driven at the terminal layer** — the same zellij keystroke-injection used by remote control. **Outbound has two modes** (config `outbound`, default `"mcp"`):
@@ -325,6 +348,8 @@ Why the fallbacks: agy self-updates by hot-swapping its binary, which leaves the
 | `TG_RELAY_SHUTDOWN_TIMEOUT_MS` | Global daemon-shutdown deadline. Must be less than the plist's `ExitTimeOut` (15s) so the runtime exits before launchd resorts to `SIGKILL`. Exceeding this logs a warning and exits anyway. | `10000` |
 | `TG_RELAY_WHISPER_MODEL` | Path to whisper.cpp GGML model for voice transcription | `~/.cache/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin` |
 | `TG_RELAY_ZELLIJ` | Absolute path to the `zellij` binary for remote-control keystroke injection. Resolved from common locations / login shell if unset. | _(auto-detected)_ |
+| `TG_RELAY_HALT_TICK_MS` | Halt-watcher poll interval — how often a remote-control channel's Claude pane is checked for a rate-limit stall. | `15000` |
+| `TG_RELAY_HALT_PERSIST_TICKS` | Consecutive polls the halt signature must hold on an unchanged screen before alerting (guards against transient blips Claude auto-recovers from). | `2` |
 | `TG_RELAY_AGY_BRAIN_ROOT` | Root dir holding agy's per-conversation `<conv-id>/…/transcript_full.jsonl` brains (Antigravity relay). | `~/.gemini/antigravity-cli/brain` |
 | `TG_RELAY_AGY_BINARY` | Command basename that identifies the agy pane during pane resolution. | `agy` |
 | `TG_RELAY_AGY_TICK_MS` | Antigravity adapter poll interval — outbound transcript relay + inbound queue drain. | `1500` |
