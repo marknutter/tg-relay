@@ -1,21 +1,27 @@
 /**
- * Unit tests for the halt-watch episode state machine (Claude Code API
- * rate-limit/overload detection).
+ * Unit tests for the halt-watch episode state machine (Claude Code API-layer
+ * halt detection).
  *
  * Tests are written against the public SPEC only — `src/halt-watch.ts` is
- * treated as a black box. Only the two PURE exports are exercised here:
+ * treated as a black box. The exports exercised here:
  *
- *   detectHalt(screen)                       — transient-halt signature match
+ *   detectHalt(screen)                       — API-layer halt signature match
+ *   extractHaltReason(screen)                — pull the `API Error: …` line out
  *   advanceHaltState(prev, screen, persist)  — per-tick episode state machine
  *   initialHaltState()                       — fresh-episode constructor
  *
  * The side-effecting helpers (readPaneScreen, injectClaudeText) shell out to
  * zellij and are out of scope for unit tests.
+ *
+ * Detection is now BROAD: any screen containing the literal substring
+ * "API Error:" (case-insensitive) is a halt. The old "transient phrase"
+ * requirement is gone.
  */
 
 import { describe, test, expect } from 'bun:test'
 import {
   detectHalt,
+  extractHaltReason,
   advanceHaltState,
   initialHaltState,
   type HaltState,
@@ -26,57 +32,63 @@ const REAL_TRIGGER =
   '⏺ API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited'
 
 // ════════════════════════════════════════════════════════════════════════
-//  detectHalt — transient rate-limit/overload signature
+//  detectHalt — broad "API Error:" substring match
 // ════════════════════════════════════════════════════════════════════════
 
 describe('detectHalt', () => {
   // ─── positive cases ────────────────────────────────────────────────────
 
-  test('detects the exact real-world trigger string', () => {
+  test('detects the exact real-world rate-limit trigger string', () => {
     expect(detectHalt(REAL_TRIGGER)).toBe(true)
   })
 
-  test('detects "temporarily limiting requests" variant', () => {
+  test('detects a 500 internal server error halt', () => {
     expect(
-      detectHalt('API Error: temporarily limiting requests right now'),
+      detectHalt(
+        '⏺ API Error: 500 Internal server error. This is a server-side issue, usually temporary.',
+      ),
     ).toBe(true)
   })
 
-  test('detects "rate limited" variant', () => {
-    expect(detectHalt('API Error · Rate limited')).toBe(true)
+  test('detects a 529 Overloaded halt', () => {
+    expect(detectHalt('API Error: 529 Overloaded')).toBe(true)
   })
 
-  test('detects "overloaded" variant', () => {
-    expect(detectHalt('API Error: server is overloaded, try again')).toBe(true)
+  test('detects a 503 Service Unavailable halt', () => {
+    expect(detectHalt('API Error: 503 Service Unavailable')).toBe(true)
   })
 
-  test('matches parts INDEPENDENTLY across wrapped lines (not adjacency)', () => {
-    // "API Error" on one line, the transient phrase two lines later.
+  test('detects a bare connection error halt', () => {
+    expect(detectHalt('API Error: Connection error.')).toBe(true)
+  })
+
+  test('detects a 404 not found halt (broad match — any API Error:)', () => {
+    expect(detectHalt('API Error: 404 not found')).toBe(true)
+  })
+
+  // The OLD spec asserted this was false (auth error, no transient phrase).
+  // Under the broadened spec it is now TRUE because it contains "API Error:".
+  test('detects an auth-error halt ("invalid x-api-key") — now true', () => {
+    expect(detectHalt('⏺ API Error: invalid x-api-key')).toBe(true)
+  })
+
+  test('detects the halt line embedded in surrounding session output', () => {
     const screen = [
-      '⏺ API Error: Server is temporarily',
-      'unrelated wrapped content here',
-      'Rate limited',
+      '⏺ Running the build...',
+      '⏺ API Error: 529 Overloaded',
+      'retrying shortly',
     ].join('\n')
-    expect(detectHalt(screen)).toBe(true)
-  })
-
-  test('order-independent: transient phrase BEFORE the error prefix still matches', () => {
-    const screen = ['some overloaded notice', 'then later: API Error'].join('\n')
     expect(detectHalt(screen)).toBe(true)
   })
 
   // ─── case-insensitivity ────────────────────────────────────────────────
 
-  test('case-insensitive on the error prefix ("api error")', () => {
+  test('case-insensitive on the prefix ("api error:")', () => {
     expect(detectHalt('api error: rate limited')).toBe(true)
   })
 
-  test('case-insensitive on the transient phrase ("OVERLOADED")', () => {
-    expect(detectHalt('API ERROR: OVERLOADED')).toBe(true)
-  })
-
-  test('mixed casing across both parts still matches', () => {
-    expect(detectHalt('Api ErRoR — Temporarily Limiting Requests')).toBe(true)
+  test('case-insensitive with mixed casing ("ApI eRrOr:")', () => {
+    expect(detectHalt('ApI eRrOr: something went wrong')).toBe(true)
   })
 
   // ─── negative cases ────────────────────────────────────────────────────
@@ -85,32 +97,127 @@ describe('detectHalt', () => {
     expect(detectHalt('')).toBe(false)
   })
 
-  test('normal session output with neither part → false', () => {
-    expect(
-      detectHalt('⏺ Running tests... all 42 passed. Done.'),
-    ).toBe(false)
+  test('normal session output with no "API Error:" line → false', () => {
+    expect(detectHalt('⏺ Running tests... all 42 passed. Done.')).toBe(false)
   })
 
-  test('"API Error" but no transient phrase (auth error) → false', () => {
-    expect(detectHalt('⏺ API Error: invalid x-api-key')).toBe(false)
+  test('prose mentioning an api error WITHOUT the colon form → false', () => {
+    expect(detectHalt('the api returned an error')).toBe(false)
   })
 
-  test('"API Error" with an unrelated message → false', () => {
-    expect(detectHalt('API Error: 404 not found')).toBe(false)
+  test('"API Error" WITHOUT a following colon → false', () => {
+    expect(detectHalt('handling API Error cases in code')).toBe(false)
   })
 
-  test('transient phrase present but NO "API Error" → false', () => {
+  test('transient phrase alone (no "API Error:") → false', () => {
     expect(detectHalt('the server is overloaded today')).toBe(false)
   })
+})
 
-  test('"rate limited" alone without "API Error" → false', () => {
-    expect(detectHalt('You have been rate limited by upstream.')).toBe(false)
+// ════════════════════════════════════════════════════════════════════════
+//  extractHaltReason — pull the `API Error: …` line for the alert message
+// ════════════════════════════════════════════════════════════════════════
+
+describe('extractHaltReason', () => {
+  // ─── basic extraction ──────────────────────────────────────────────────
+
+  test('extracts from "API Error:" to end of line, dropping the bullet/leading space', () => {
+    const screen =
+      '⏺ API Error: 500 Internal server error. This is a server-side issue'
+    expect(extractHaltReason(screen)).toBe(
+      'API Error: 500 Internal server error. This is a server-side issue',
+    )
   })
 
-  test('"temporarily limiting requests" alone without "API Error" → false', () => {
-    expect(
-      detectHalt('We are temporarily limiting requests for maintenance.'),
-    ).toBe(false)
+  test('extracts the real-world rate-limit reason', () => {
+    expect(extractHaltReason(REAL_TRIGGER)).toBe(
+      'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+    )
+  })
+
+  // ─── newline boundary ──────────────────────────────────────────────────
+
+  test('captures only up to the newline (does NOT span past it)', () => {
+    expect(extractHaltReason('API Error: 500 oops\nnext line here')).toBe(
+      'API Error: 500 oops',
+    )
+  })
+
+  test('extracts the halt line out of a multi-line screen', () => {
+    const screen = [
+      '⏺ Running the build...',
+      '⏺ API Error: 529 Overloaded',
+      'retrying shortly',
+    ].join('\n')
+    expect(extractHaltReason(screen)).toBe('API Error: 529 Overloaded')
+  })
+
+  // ─── whitespace collapsing ─────────────────────────────────────────────
+
+  test('collapses runs of internal whitespace to single spaces', () => {
+    expect(extractHaltReason('API Error:   500    oops')).toBe(
+      'API Error: 500 oops',
+    )
+  })
+
+  test('trims trailing whitespace on the line', () => {
+    expect(extractHaltReason('API Error: 503 Service Unavailable   ')).toBe(
+      'API Error: 503 Service Unavailable',
+    )
+  })
+
+  // ─── case-insensitivity ────────────────────────────────────────────────
+
+  test('case-insensitive match extracts the lowercase variant verbatim', () => {
+    expect(extractHaltReason('api error: whatever')).toBe('api error: whatever')
+  })
+
+  // ─── first-match semantics ─────────────────────────────────────────────
+
+  test('returns the FIRST "API Error:" line when multiple exist', () => {
+    const screen = [
+      'API Error: first one here',
+      'API Error: second one here',
+    ].join('\n')
+    expect(extractHaltReason(screen)).toBe('API Error: first one here')
+  })
+
+  // ─── truncation ────────────────────────────────────────────────────────
+
+  test('truncates a reason over 160 chars to 159 + "…" (total length 160)', () => {
+    // Build an "API Error:" line whose reason far exceeds 160 chars.
+    const longReason = 'API Error: ' + 'x'.repeat(300)
+    expect(longReason.length).toBeGreaterThan(160)
+    const result = extractHaltReason(longReason)
+    expect(result).not.toBe(null)
+    expect(result!.length).toBe(160)
+    expect(result!.endsWith('…')).toBe(true)
+    // The character before the ellipsis is part of the original content.
+    expect(result!.slice(0, 159)).toBe(longReason.slice(0, 159))
+  })
+
+  test('does NOT truncate a reason at or under 160 chars (no ellipsis)', () => {
+    // Exactly 160 chars total reason.
+    const body = 'y'.repeat(160 - 'API Error: '.length)
+    const reason = 'API Error: ' + body
+    expect(reason.length).toBe(160)
+    const result = extractHaltReason(reason)
+    expect(result).toBe(reason)
+    expect(result!.endsWith('…')).toBe(false)
+  })
+
+  // ─── null cases ────────────────────────────────────────────────────────
+
+  test('empty string → null', () => {
+    expect(extractHaltReason('')).toBe(null)
+  })
+
+  test('normal output with no "API Error:" line → null', () => {
+    expect(extractHaltReason('⏺ All good — tests passing.')).toBe(null)
+  })
+
+  test('"API Error" without a colon → null', () => {
+    expect(extractHaltReason('handling API Error cases in code')).toBe(null)
   })
 })
 
@@ -137,11 +244,11 @@ describe('initialHaltState', () => {
 //  advanceHaltState — per-tick episode state machine
 // ════════════════════════════════════════════════════════════════════════
 
-// A screen that does NOT detect as a halt (normal output).
+// A screen that does NOT detect as a halt (normal output, no "API Error:").
 const NORMAL = '⏺ All good — tests passing.'
-// Two distinct halting screens (both detect true) used for change-tracking.
-const HALT_A = 'API Error: rate limited (screen A)'
-const HALT_B = 'API Error: rate limited (screen B)'
+// Two distinct halting screens (both contain "API Error:") for change-tracking.
+const HALT_A = 'API Error: 529 Overloaded (screen A)'
+const HALT_B = 'API Error: Connection error. (screen B)'
 
 describe('advanceHaltState', () => {
   // ─── rule 1: no halt resets the episode ────────────────────────────────

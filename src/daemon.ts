@@ -36,6 +36,7 @@ import { parseControlCommand, injectCommand, type RemoteControlConfig } from './
 import {
   advanceHaltState,
   initialHaltState,
+  extractHaltReason,
   readPaneScreen,
   injectClaudeText,
   HALT_TICK_MS,
@@ -1474,11 +1475,12 @@ async function haltWatchTick(state: ChannelState): Promise<void> {
       log(state.config.name, `halt-watch: session halted but access.allowFrom is empty — no one to alert`)
       return
     }
+    const reason = extractHaltReason(read.screen) ?? 'API error'
     await state.bot.api.sendMessage(
       chatId,
-      `⚠️ ${state.config.name} session halted — API rate limit (server-side, not your usage). Reply here to resume (e.g. "continue").`,
+      `⚠️ ${state.config.name} session halted — ${reason}\nReply here to resume (e.g. "continue").`,
     ).catch(() => {})
-    log(state.config.name, `halt-watch: alerted ${chatId} (session halted on rate limit)`)
+    log(state.config.name, `halt-watch: alerted ${chatId} (${reason})`)
   } finally {
     rt.ticking = false
   }

@@ -43,23 +43,36 @@ export const HALT_PERSIST_TICKS = parseInt(process.env.TG_RELAY_HALT_PERSIST_TIC
 
 // ── Detection (pure) ─────────────────────────────────────────────────────────
 
-/** Claude Code's error chrome prefix for any API-layer failure. */
-const HALT_PREFIX = /API Error/i
 /**
- * Transient-overload phrases worth alerting on. Deliberately narrow: a generic
- * API error (auth, bad request) isn't something `continue` fixes, but a rate
- * limit / overload is exactly the "type continue to resume" case.
+ * Claude Code's halt chrome: a turn that fails at the API layer renders an
+ * `API Error: <detail>` line and stops. We alert on ANY such halt — rate
+ * limits, 5xx server errors, overloads, timeouts — because from the user's
+ * (away-from-keyboard) standpoint they're the same event: the session stopped
+ * and needs a nudge to resume. The colon anchors on the actual error line so a
+ * stray "api error" mentioned in prose doesn't match. The unchanged-screen
+ * persistence guard in `advanceHaltState` is what rejects transient blips Claude
+ * auto-recovers from — a session mid-retry keeps redrawing (countdown timer), so
+ * its screen changes and never trips the alert; only a session that has given up
+ * and sits static does.
  */
-const HALT_TRANSIENT = /temporarily limiting requests|rate limited|overloaded/i
+const HALT_CHROME = /API Error:/i
+
+/** True when the pane screen shows an API-layer halt (any `API Error:` line). */
+export function detectHalt(screen: string): boolean {
+  return HALT_CHROME.test(screen)
+}
 
 /**
- * True when the pane screen shows a transient API halt. Requires BOTH the error
- * prefix and a transient phrase to be present anywhere on screen — checked
- * independently (not adjacency) so a signature split across wrapped TUI lines
- * still matches.
+ * Pull the `API Error: …` line out of the screen for the alert message, so the
+ * user sees WHAT halted (e.g. `API Error: 500 Internal server error`) instead of
+ * a generic notice. Returns the trimmed, whitespace-collapsed line (truncated to
+ * a sane length), or null when no halt line is present.
  */
-export function detectHalt(screen: string): boolean {
-  return HALT_PREFIX.test(screen) && HALT_TRANSIENT.test(screen)
+export function extractHaltReason(screen: string): string | null {
+  const m = screen.match(/API Error:[^\n]*/i)
+  if (!m) return null
+  const reason = m[0].replace(/\s+/g, ' ').trim()
+  return reason.length > 160 ? reason.slice(0, 159) + '…' : reason
 }
 
 // ── Episode state machine (pure) ─────────────────────────────────────────────
