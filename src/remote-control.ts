@@ -39,6 +39,12 @@ export type RemoteControlConfig = {
    * the full hardcoded set is available. Cannot widen beyond the hardcoded set.
    */
   commands?: string[]
+  /**
+   * Halt-watching (issue #79): poll this channel's Claude pane and alert over
+   * Telegram when the session stalls on a transient API rate-limit error.
+   * Defaults to ON wherever remote-control is enabled; set false to opt out.
+   */
+  haltWatch?: boolean
 }
 
 /** Model aliases accepted by `/model <alias>` as a one-shot (no TUI picker). */
@@ -343,7 +349,7 @@ export function resolveTargetPane(
 
 export type InjectResult = { ok: true } | { ok: false; error: string }
 
-function zellijError(err: unknown, what: string): string {
+export function zellijError(err: unknown, what: string): string {
   const e = err as Error & { stderr?: Buffer }
   const stderr = e.stderr ? e.stderr.toString().trim() : ''
   return stderr || e.message || `zellij ${what} failed`
