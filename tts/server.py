@@ -10,14 +10,21 @@ Reference audio is resolved per-channel:
   2. ~/.cache/tg-relay-tts/reference.wav + reference.txt (global fallback)
   3. None → HTTP 404, daemon falls back to text reply
 
-The model (F5TTS_v1_Base) is loaded once at startup and kept warm.
+Memory: the F5-TTS model (~4 GB resident on the MPS GPU / unified memory) is
+loaded LAZILY on the first synth, held warm only briefly so a burst of replies
+reuses it, then EVICTED after TG_RELAY_TTS_IDLE_EVICT_SEC of idle to return the
+RAM. First synth after idle pays a ~15s cold load; the daemon's timeout (5 min)
+covers it. This keeps voice from costing ~4 GB of warm RAM 24/7 on a 16 GB box.
 """
 
+import gc
 import io
 import json
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -35,6 +42,10 @@ CHANNELS_ROOT = HOME / ".claude" / "channels"
 GLOBAL_REF_DIR = HOME / ".cache" / "tg-relay-tts"
 DEFAULT_NFE_STEP = int(os.environ.get("TG_RELAY_TTS_NFE_STEP", "6"))
 DEFAULT_MODEL = os.environ.get("TG_RELAY_TTS_MODEL", "F5TTS_v1_Base")
+# Evict the model after this many seconds of no synth requests (0 = never evict,
+# i.e. the old always-warm behavior). Default 120s: a back-and-forth of voice
+# replies stays warm, then the ~4 GB is released ~2 min after the last one.
+IDLE_EVICT_SEC = int(os.environ.get("TG_RELAY_TTS_IDLE_EVICT_SEC", "120"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,11 +53,60 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-relay-tts")
 
-# ── Model (loaded at startup, held warm) ────────────────────────────────────
+# ── Model lifecycle (lazy load + idle eviction) ──────────────────────────────
+# The model is NOT loaded at startup. get_tts() loads it on demand under the
+# lock; the background evictor frees it after IDLE_EVICT_SEC idle. The lock is
+# held through inference so the evictor never frees mid-synth.
 
-log.info(f"loading F5-TTS model: {DEFAULT_MODEL}")
-tts = F5TTS(model=DEFAULT_MODEL)
-log.info(f"model loaded, device={tts.device}")
+_tts = None
+_tts_lock = threading.RLock()
+_last_used = 0.0
+
+
+def get_tts():
+    """Return the F5-TTS model, loading it (under lock) if not resident."""
+    global _tts, _last_used
+    with _tts_lock:
+        if _tts is None:
+            log.info(f"loading F5-TTS model: {DEFAULT_MODEL}")
+            t0 = time.time()
+            _tts = F5TTS(model=DEFAULT_MODEL)
+            log.info(f"model loaded in {time.time() - t0:.1f}s, device={_tts.device}")
+        _last_used = time.time()
+        return _tts
+
+
+def _evict_model():
+    """Drop the model and free its GPU/unified memory."""
+    global _tts
+    with _tts_lock:
+        if _tts is None:
+            return
+        log.info("evicting idle F5-TTS model to free memory")
+        _tts = None
+    gc.collect()
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception as err:
+        log.warning(f"mps empty_cache failed: {err}")
+
+
+def _evictor_loop():
+    """Background thread: evict the model once it's been idle past the TTL."""
+    if IDLE_EVICT_SEC <= 0:
+        return
+    while True:
+        time.sleep(min(30, IDLE_EVICT_SEC))
+        with _tts_lock:
+            loaded = _tts is not None
+            idle = time.time() - _last_used
+        if loaded and idle >= IDLE_EVICT_SEC:
+            _evict_model()
+
+
+threading.Thread(target=_evictor_loop, daemon=True, name="tts-evictor").start()
 
 # ── Reference resolution ────────────────────────────────────────────────────
 
@@ -98,11 +158,23 @@ class SynthesizeRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": str(tts.device), "model": DEFAULT_MODEL}
+    # Do NOT load the model just to answer a health check.
+    with _tts_lock:
+        loaded = _tts is not None
+        device = str(_tts.device) if loaded else None
+    return {
+        "status": "ok",
+        "model": DEFAULT_MODEL,
+        "model_loaded": loaded,
+        "device": device,
+        "idle_evict_sec": IDLE_EVICT_SEC,
+    }
 
 
 @app.post("/synthesize")
 def synthesize(req: SynthesizeRequest):
+    global _last_used
+
     if not req.text.strip():
         raise HTTPException(400, "text must not be empty")
 
@@ -120,19 +192,26 @@ def synthesize(req: SynthesizeRequest):
     speed = req.speed if req.speed is not None else float(cfg.get("speed", 1.0))
     log.info(f"synthesize channel={req.channel} nfe={nfe} speed={speed} text={req.text[:60]!r}")
 
-    try:
-        wav, sr, _ = tts.infer(
-            ref_file=str(ref_audio),
-            ref_text=ref_text,
-            gen_text=req.text,
-            nfe_step=nfe,
-            speed=speed,
-            show_info=lambda *_: None,  # silence stdout chatter
-            progress=None,
-        )
-    except Exception as err:
-        log.exception("synthesis failed")
-        raise HTTPException(500, f"synthesis failed: {err}")
+    # Hold the lock across load+infer so the evictor can't free mid-synth and
+    # concurrent requests serialize on the single GPU model.
+    with _tts_lock:
+        tts = get_tts()
+        try:
+            wav, sr, _ = tts.infer(
+                ref_file=str(ref_audio),
+                ref_text=ref_text,
+                gen_text=req.text,
+                nfe_step=nfe,
+                speed=speed,
+                show_info=lambda *_: None,  # silence stdout chatter
+                progress=None,
+            )
+        except Exception as err:
+            log.exception("synthesis failed")
+            raise HTTPException(500, f"synthesis failed: {err}")
+        finally:
+            # Start the idle clock from synth completion, not model load.
+            _last_used = time.time()
 
     buf = io.BytesIO()
     sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
@@ -147,5 +226,5 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("TG_RELAY_TTS_PORT", "8077"))
     host = os.environ.get("TG_RELAY_TTS_HOST", "127.0.0.1")
-    log.info(f"starting on {host}:{port}")
+    log.info(f"starting on {host}:{port} (lazy load, idle-evict={IDLE_EVICT_SEC}s)")
     uvicorn.run(app, host=host, port=port, log_level="warning")
