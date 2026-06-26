@@ -833,6 +833,52 @@ function setupInboundHandlers(state: ChannelState): void {
     await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
   })
 
+  // Presence override commands (#86): /here and /away let Mark manually
+  // force presence state from Telegram. The override expires after
+  // OVERRIDE_TTL_MS, then auto-detection resumes.
+
+  bot.command('here', async ctx => {
+    if (ctx.chat?.type !== 'private') return
+    const from = ctx.from
+    if (!from) return
+    const senderId = String(from.id)
+    const access = readAccessFile(stateDir)
+    if (!access.allowFrom.includes(senderId)) return  // silent drop for unpaired users
+
+    const rt = presenceRuntime
+    if (!rt) {
+      await ctx.reply('Presence runtime not active.')
+      return
+    }
+    const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+    rt.override = { present: true, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+    // Clear consumer cache so the override takes effect immediately.
+    rt.cachedShouldSend = null
+    log(config.name, `presence: /here override set by ${senderId} (expires in ${ttlMin}min)`)
+    await ctx.reply(`✅ Presence set to HERE — proactive sends will be suppressed for ${ttlMin} min.`)
+  })
+
+  bot.command('away', async ctx => {
+    if (ctx.chat?.type !== 'private') return
+    const from = ctx.from
+    if (!from) return
+    const senderId = String(from.id)
+    const access = readAccessFile(stateDir)
+    if (!access.allowFrom.includes(senderId)) return  // silent drop for unpaired users
+
+    const rt = presenceRuntime
+    if (!rt) {
+      await ctx.reply('Presence runtime not active.')
+      return
+    }
+    const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+    rt.override = { present: false, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+    // Clear consumer cache so the override takes effect immediately.
+    rt.cachedShouldSend = null
+    log(config.name, `presence: /away override set by ${senderId} (expires in ${ttlMin}min)`)
+    await ctx.reply(`✅ Presence set to AWAY — proactive sends will come through for ${ttlMin} min.`)
+  })
+
   // Inbound message handlers
   async function handleInbound(
     ctx: Context,
