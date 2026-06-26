@@ -1708,42 +1708,99 @@ function startPresence(): void {
       hostname: '0.0.0.0',
       fetch: async (req) => {
         const url = new URL(req.url)
-        if (url.pathname !== '/presence') {
-          return new Response('Not Found', { status: 404 })
+
+        // ── GET/POST /presence ──────────────────────────────────────────
+        if (url.pathname === '/presence') {
+          if (req.method === 'GET') {
+            const body = buildPresenceResponse(rt.state, PRESENCE_STALE_SECONDS)
+            const now = Date.now()
+            return Response.json({
+              ...body,
+              gating: PRESENCE_GATING,
+              producer: PRESENCE_PRODUCER,
+              override: rt.override && rt.override.expiresAt > now
+                ? { present: rt.override.present, expiresInSeconds: Math.round((rt.override.expiresAt - now) / 1000) }
+                : null,
+            })
+          }
+
+          if (req.method === 'POST') {
+            // Bearer token required for POST.
+            if (!PRESENCE_TOKEN) {
+              return new Response('POST /presence is disabled (no PRESENCE_TOKEN configured)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            let body: unknown
+            try {
+              body = await req.json()
+            } catch {
+              return Response.json({ error: 'invalid JSON' }, { status: 400 })
+            }
+            const validated = validatePostPresence(body)
+            if (!validated.ok) {
+              return Response.json({ error: validated.error }, { status: 400 })
+            }
+            rt.state = { present: validated.present, ts: Date.now(), source: validated.source }
+            // Clear the consumer cache so the new state takes effect immediately.
+            rt.cachedShouldSend = null
+            logGlobal(`presence: POST update present=${validated.present} source=${validated.source}`)
+            return Response.json({ ok: true })
+          }
+
+          return new Response('Method Not Allowed', { status: 405 })
         }
 
-        if (req.method === 'GET') {
-          const body = buildPresenceResponse(rt.state, PRESENCE_STALE_SECONDS)
-          return Response.json(body)
+        // ── POST/DELETE /presence/override ───────────────────────────────
+        // For the menubar app and API consumers to set /here /away style
+        // overrides without going through Telegram.
+        if (url.pathname === '/presence/override') {
+          if (req.method === 'POST') {
+            if (!PRESENCE_TOKEN) {
+              return new Response('POST /presence/override is disabled (no PRESENCE_TOKEN)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            let body: unknown
+            try {
+              body = await req.json()
+            } catch {
+              return Response.json({ error: 'invalid JSON' }, { status: 400 })
+            }
+            const obj = body as Record<string, unknown>
+            if (typeof obj.present !== 'boolean') {
+              return Response.json({ error: '"present" must be a boolean' }, { status: 400 })
+            }
+            rt.override = { present: obj.present, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+            rt.cachedShouldSend = null
+            const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+            const expiresInSeconds = Math.round(OVERRIDE_TTL_MS / 1000)
+            logGlobal(`presence: override set via API present=${obj.present} (expires in ${ttlMin}min)`)
+            return Response.json({ ok: true, present: obj.present, expiresInSeconds })
+          }
+
+          if (req.method === 'DELETE') {
+            if (!PRESENCE_TOKEN) {
+              return new Response('DELETE /presence/override is disabled (no PRESENCE_TOKEN)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            rt.override = null
+            rt.cachedShouldSend = null
+            logGlobal('presence: override cleared via API')
+            return Response.json({ ok: true })
+          }
+
+          return new Response('Method Not Allowed', { status: 405 })
         }
 
-        if (req.method === 'POST') {
-          // Bearer token required for POST.
-          if (!PRESENCE_TOKEN) {
-            return new Response('POST /presence is disabled (no PRESENCE_TOKEN configured)', { status: 403 })
-          }
-          const auth = req.headers.get('authorization') ?? ''
-          if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
-            return new Response('Unauthorized', { status: 401 })
-          }
-          let body: unknown
-          try {
-            body = await req.json()
-          } catch {
-            return Response.json({ error: 'invalid JSON' }, { status: 400 })
-          }
-          const validated = validatePostPresence(body)
-          if (!validated.ok) {
-            return Response.json({ error: validated.error }, { status: 400 })
-          }
-          rt.state = { present: validated.present, ts: Date.now(), source: validated.source }
-          // Clear the consumer cache so the new state takes effect immediately.
-          rt.cachedShouldSend = null
-          logGlobal(`presence: POST update present=${validated.present} source=${validated.source}`)
-          return Response.json({ ok: true })
-        }
-
-        return new Response('Method Not Allowed', { status: 405 })
+        return new Response('Not Found', { status: 404 })
       },
     })
     logGlobal(`presence: HTTP endpoint listening on :${PRESENCE_PORT}`)
