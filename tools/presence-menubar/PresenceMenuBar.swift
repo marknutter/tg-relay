@@ -2,8 +2,9 @@
  * Presence menubar app — macOS status-bar indicator for tg-relay presence.
  *
  * Shows 🟢 (present), 🔴 (away), ⚠️ (stale), or ❓ (unreachable) in the
- * menubar. Dropdown shows state details and lets you toggle /here /away
- * overrides via the daemon's HTTP API.
+ * menubar. Dropdown shows state details, daemon status, and lets you:
+ * - Toggle /here /away overrides via the daemon's HTTP API
+ * - Start / Stop / Restart the tg-relay daemon (via launchctl)
  *
  * Usage:
  *   swiftc -o PresenceMenuBar PresenceMenuBar.swift -framework Cocoa && ./PresenceMenuBar
@@ -21,6 +22,11 @@ import Foundation
 let baseURL = ProcessInfo.processInfo.environment["PRESENCE_URL"] ?? "http://localhost:7780"
 let token   = ProcessInfo.processInfo.environment["PRESENCE_TOKEN"] ?? ""
 let pollInterval: TimeInterval = 5.0
+
+let daemonLabel = "com.marknutter.tg-relay"
+let daemonPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(daemonLabel).plist"
+let menubarLabel = "com.marknutter.presence-menubar"
+let menubarPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(menubarLabel).plist"
 
 // MARK: - State model
 
@@ -41,6 +47,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var lastStatus: PresenceStatus?
+    private var daemonRunning: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -55,6 +62,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Polling
 
     private func poll() {
+        // Check daemon status
+        daemonRunning = isDaemonRunning()
+
         guard let url = URL(string: "\(baseURL)/presence") else {
             DispatchQueue.main.async { self.updateUI(status: nil) }
             return
@@ -92,8 +102,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let s = status else {
             statusItem.button?.title = "❓"
             addDisabled(menu, "Presence: Unreachable")
-            addDisabled(menu, "Daemon not running or endpoint not reachable")
+            if !daemonRunning {
+                addDisabled(menu, "⛔ Daemon is not running")
+            } else {
+                addDisabled(menu, "Daemon is running but endpoint not reachable")
+            }
             addDisabled(menu, "\(baseURL)/presence")
+            menu.addItem(NSMenuItem.separator())
+            addDaemonControls(menu)
             menu.addItem(NSMenuItem.separator())
             addQuit(menu)
             statusItem.menu = menu
@@ -149,9 +165,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
+
+        // Daemon controls
+        addDaemonControls(menu)
+
+        menu.addItem(NSMenuItem.separator())
         addQuit(menu)
 
         statusItem.menu = menu
+    }
+
+    // MARK: - Daemon controls
+
+    private func addDaemonControls(_ menu: NSMenu) {
+        if daemonRunning {
+            addDisabled(menu, "✅ Daemon running")
+            let restartItem = NSMenuItem(title: "🔄  Restart Daemon", action: #selector(restartDaemon), keyEquivalent: "r")
+            restartItem.target = self
+            menu.addItem(restartItem)
+            let stopItem = NSMenuItem(title: "⏹  Stop Daemon", action: #selector(stopDaemon), keyEquivalent: "")
+            stopItem.target = self
+            menu.addItem(stopItem)
+        } else {
+            addDisabled(menu, "⛔ Daemon stopped")
+            let startItem = NSMenuItem(title: "▶️  Start Daemon", action: #selector(startDaemon), keyEquivalent: "r")
+            startItem.target = self
+            menu.addItem(startItem)
+        }
     }
 
     // MARK: - Actions
@@ -168,8 +208,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         deleteOverride()
     }
 
+    @objc private func startDaemon() {
+        runLaunchctl(["load", daemonPlist])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
+    }
+
+    @objc private func stopDaemon() {
+        runLaunchctl(["unload", daemonPlist])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.poll() }
+    }
+
+    @objc private func restartDaemon() {
+        // kickstart -k restarts in-place using the CURRENT plist
+        let uid = getuid()
+        runLaunchctl(["kickstart", "-k", "gui/\(uid)/\(daemonLabel)"])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Daemon helpers
+
+    private func isDaemonRunning() -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        let uid = getuid()
+        task.arguments = ["print", "gui/\(uid)/\(daemonLabel)"]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func runLaunchctl(_ args: [String]) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = args
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
     }
 
     // MARK: - API calls
