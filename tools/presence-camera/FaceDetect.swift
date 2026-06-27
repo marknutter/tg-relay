@@ -48,6 +48,12 @@ class FaceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
     private var captured = false
     private var resultCode: Int32 = 1
+    private var frameCount = 0
+
+    /// Number of frames to skip before processing. Gives the camera's
+    /// auto-exposure and white-balance time to settle — the first few
+    /// frames are typically dark or colour-shifted.
+    private let warmupFrames = 10
 
     func run() -> Int32 {
         // ── Camera authorization ────────────────────────────────────────
@@ -84,8 +90,9 @@ class FaceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
             return 1
         }
 
-        // Low resolution is sufficient for face detection and saves power.
-        session.sessionPreset = .low
+        // Medium resolution balances face-detection accuracy at desk distance
+        // with power use. .low (192×144) proved too small for reliable detection.
+        session.sessionPreset = .medium
         guard session.canAddInput(input) else {
             printResult(detected: false, error: "cannot_add_input")
             return 1
@@ -105,10 +112,10 @@ class FaceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         session.addOutput(output)
 
-        // ── Capture one frame ───────────────────────────────────────────
+        // ── Capture a frame (after warmup) ──────────────────────────────
         session.startRunning()
 
-        // Wait up to 5 seconds for the first frame.
+        // Wait up to 5 seconds for a usable frame (after warmup).
         let deadline = Date().addingTimeInterval(5.0)
         while !captured && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
@@ -130,8 +137,9 @@ class FaceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Only process the first frame.
-        guard !captured else { return }
+        // Skip early frames while the camera warms up (auto-exposure/WB).
+        frameCount += 1
+        guard !captured, frameCount > warmupFrames else { return }
         captured = true
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
