@@ -161,6 +161,18 @@ const socketPath = (channelName && stateDir) ? ipcAddress(channelName, stateDir)
 if (resolution.ok) {
   process.stderr.write(`tg-relay plugin: channel=${channelName} socket=${socketPath}\n`)
   logToRouter(`resolved channel='${channelName}' cwd='${resolutionCwd}' parent=${claudeCodePid ?? 'unknown'}`)
+
+  // Write a PID marker so the stop hook (guard-telegram-reply.sh) can
+  // detect whether THIS Claude Code session has the tg-relay plugin loaded.
+  // Without this, the hook would block ALL sessions, even those without tg-relay.
+  if (stateDir && claudeCodePid) {
+    const pidFile = join(stateDir, `.cc_pid_${claudeCodePid}`)
+    try { writeFileSync(pidFile, String(process.pid)) } catch {}
+    const cleanup = () => { try { const { unlinkSync } = require('fs'); unlinkSync(pidFile) } catch {} }
+    process.on('exit', cleanup)
+    process.on('SIGTERM', () => { cleanup(); process.exit(0) })
+    process.on('SIGINT', () => { cleanup(); process.exit(0) })
+  }
 } else {
   process.stderr.write(`tg-relay plugin: ${resolution.reason}. Running MCP server but skipping socket connection — Telegram tools will return this reason if called.\n`)
   logToRouter(`channel resolution failed: ${resolution.reason}`)
