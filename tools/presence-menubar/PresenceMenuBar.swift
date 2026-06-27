@@ -5,7 +5,7 @@
  * menubar. Features:
  * - Presence status display with override controls (here/away)
  * - Daemon management (start/stop/restart via launchctl)
- * - Settings window with sliders for presence thresholds
+ * - Settings window with sliders and toggles for presence thresholds
  *
  * Build as .app:
  *   ./build.sh
@@ -27,15 +27,57 @@ let pollInterval: TimeInterval = 5.0
 let daemonLabel = "com.marknutter.tg-relay"
 let daemonPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(daemonLabel).plist"
 
-// MARK: - Settings keys (UserDefaults)
+// MARK: - Settings keys and defaults (UserDefaults + env var mapping)
 
-let kAwayIdle   = "awayIdleSeconds"      // How long idle before → away
-let kFaceSample = "faceSampleSeconds"    // Camera check interval
-let kStale      = "staleSeconds"         // When state is considered stale
+struct Setting {
+    let key: String       // UserDefaults key
+    let envVar: String    // Daemon env var name
+    let label: String     // UI label
+    let unit: SettingUnit
+    let min: Int
+    let max: Int
+    let defaultValue: Int
+}
 
-let defaultAwayIdle   = 90
-let defaultFaceSample = 15
-let defaultStale      = 45
+enum SettingUnit {
+    case seconds      // stored as seconds, env var as seconds
+    case milliseconds // stored as seconds in UI, env var as milliseconds
+}
+
+let sliderSettings: [Setting] = [
+    Setting(key: "awayIdleSeconds", envVar: "TG_RELAY_AWAY_IDLE_SECONDS",
+            label: "Go away after idle",
+            unit: .seconds, min: 15, max: 600, defaultValue: 90),
+    Setting(key: "presentIdleSeconds", envVar: "TG_RELAY_PRESENT_IDLE_SECONDS",
+            label: "Return to present after activity",
+            unit: .seconds, min: 5, max: 120, defaultValue: 30),
+    Setting(key: "faceSampleSeconds", envVar: "TG_RELAY_FACE_SAMPLE_MS",
+            label: "Face scan interval",
+            unit: .milliseconds, min: 5, max: 120, defaultValue: 15),
+    Setting(key: "presenceTickSeconds", envVar: "TG_RELAY_PRESENCE_TICK_MS",
+            label: "Presence poll interval",
+            unit: .milliseconds, min: 3, max: 60, defaultValue: 10),
+    Setting(key: "staleSeconds", envVar: "TG_RELAY_PRESENCE_STALE_SECONDS",
+            label: "Mark stale after",
+            unit: .seconds, min: 15, max: 300, defaultValue: 45),
+    Setting(key: "overrideTtlMinutes", envVar: "TG_RELAY_PRESENCE_OVERRIDE_TTL_MS",
+            label: "Override duration",
+            unit: .milliseconds, min: 5, max: 120, defaultValue: 30),
+]
+
+struct Toggle {
+    let key: String
+    let envVar: String
+    let label: String
+    let defaultValue: Bool
+}
+
+let toggleSettings: [Toggle] = [
+    Toggle(key: "camera", envVar: "TG_RELAY_PRESENCE_CAMERA",
+           label: "Face detection (camera)", defaultValue: true),
+    Toggle(key: "gating", envVar: "TG_RELAY_PRESENCE_GATING",
+           label: "Presence gating (suppress sends when present)", defaultValue: true),
+]
 
 // MARK: - State model
 
@@ -54,12 +96,8 @@ struct PresenceStatus {
 
 class SettingsWindowController: NSObject {
     private var window: NSWindow?
-    private var awaySlider: NSSlider!
-    private var awayLabel: NSTextField!
-    private var faceSlider: NSSlider!
-    private var faceLabel: NSTextField!
-    private var staleSlider: NSSlider!
-    private var staleLabel: NSTextField!
+    private var sliders: [(Setting, NSSlider, NSTextField)] = []
+    private var toggleButtons: [(Toggle, NSButton)] = []
     private weak var appDelegate: AppDelegate?
 
     init(appDelegate: AppDelegate) {
@@ -74,8 +112,15 @@ class SettingsWindowController: NSObject {
             return
         }
 
+        let rowHeight: CGFloat = 70
+        let toggleHeight: CGFloat = 30
+        let padding: CGFloat = 60  // top/bottom padding + button
+        let windowHeight = CGFloat(sliderSettings.count) * rowHeight
+            + CGFloat(toggleSettings.count) * toggleHeight
+            + padding + 30  // section header
+
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 280),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: windowHeight),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -88,40 +133,73 @@ class SettingsWindowController: NSObject {
         content.autoresizingMask = [.width, .height]
 
         let defaults = UserDefaults.standard
-        var y: CGFloat = 230
+        sliders = []
+        toggleButtons = []
 
-        // Away idle threshold
-        y = addSliderRow(
-            to: content, y: y,
-            label: "Go away after idle:",
-            min: 30, max: 600, value: defaults.integer(forKey: kAwayIdle).clamped(30, 600, defaultAwayIdle),
-            format: { formatDuration($0) },
-            sliderOut: &awaySlider, labelOut: &awayLabel,
-            action: #selector(awaySliderChanged)
-        )
+        var y = windowHeight - 30
 
-        // Face sample interval
-        y = addSliderRow(
-            to: content, y: y,
-            label: "Camera check interval:",
-            min: 5, max: 120, value: defaults.integer(forKey: kFaceSample).clamped(5, 120, defaultFaceSample),
-            format: { formatDuration($0) },
-            sliderOut: &faceSlider, labelOut: &faceLabel,
-            action: #selector(faceSliderChanged)
-        )
+        // ── Toggles section ─────────────────────────────────
+        let toggleHeader = NSTextField(labelWithString: "Features")
+        toggleHeader.frame = NSRect(x: 20, y: y, width: 200, height: 18)
+        toggleHeader.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        toggleHeader.textColor = .secondaryLabelColor
+        content.addSubview(toggleHeader)
+        y -= 8
 
-        // Stale threshold
-        y = addSliderRow(
-            to: content, y: y,
-            label: "Stale after:",
-            min: 30, max: 300, value: defaults.integer(forKey: kStale).clamped(30, 300, defaultStale),
-            format: { formatDuration($0) },
-            sliderOut: &staleSlider, labelOut: &staleLabel,
-            action: #selector(staleSliderChanged)
-        )
+        for t in toggleSettings {
+            y -= toggleHeight
+            let stored = defaults.object(forKey: t.key) as? Bool ?? t.defaultValue
+            let btn = NSButton(checkboxWithTitle: "  \(t.label)", target: nil, action: nil)
+            btn.frame = NSRect(x: 20, y: y, width: 360, height: 22)
+            btn.state = stored ? .on : .off
+            btn.font = NSFont.systemFont(ofSize: 13)
+            content.addSubview(btn)
+            toggleButtons.append((t, btn))
+        }
+
+        y -= 20
+
+        // ── Sliders section ─────────────────────────────────
+        let slidersHeader = NSTextField(labelWithString: "Thresholds")
+        slidersHeader.frame = NSRect(x: 20, y: y, width: 200, height: 18)
+        slidersHeader.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        slidersHeader.textColor = .secondaryLabelColor
+        content.addSubview(slidersHeader)
+        y -= 5
+
+        for s in sliderSettings {
+            y -= rowHeight
+            let stored = defaults.integer(forKey: s.key)
+            let value = stored > 0 ? clamp(stored, s.min, s.max) : s.defaultValue
+
+            // Special case: override TTL is in minutes in the UI
+            let displayValue = s.key == "overrideTtlMinutes" ? value : value
+
+            let titleLabel = NSTextField(labelWithString: s.label)
+            titleLabel.frame = NSRect(x: 20, y: y + 35, width: 300, height: 18)
+            titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            content.addSubview(titleLabel)
+
+            let slider = NSSlider(frame: NSRect(x: 20, y: y + 8, width: 290, height: 20))
+            slider.minValue = Double(s.min)
+            slider.maxValue = Double(s.max)
+            slider.integerValue = displayValue
+            slider.isContinuous = true
+            slider.target = self
+            slider.action = #selector(sliderChanged(_:))
+            content.addSubview(slider)
+
+            let valLabel = NSTextField(labelWithString: formatForSetting(s, displayValue))
+            valLabel.frame = NSRect(x: 318, y: y + 8, width: 80, height: 20)
+            valLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            valLabel.alignment = .right
+            content.addSubview(valLabel)
+
+            sliders.append((s, slider, valLabel))
+        }
 
         // Apply button
-        let applyBtn = NSButton(frame: NSRect(x: 130, y: 15, width: 120, height: 32))
+        let applyBtn = NSButton(frame: NSRect(x: 150, y: 15, width: 130, height: 32))
         applyBtn.title = "Apply & Restart"
         applyBtn.bezelStyle = .rounded
         applyBtn.target = self
@@ -134,83 +212,78 @@ class SettingsWindowController: NSObject {
         window = w
     }
 
-    private func addSliderRow(
-        to view: NSView, y: CGFloat,
-        label: String,
-        min: Int, max: Int, value: Int,
-        format: @escaping (Int) -> String,
-        sliderOut: inout NSSlider!,
-        labelOut: inout NSTextField!,
-        action: Selector
-    ) -> CGFloat {
-        let titleLabel = NSTextField(labelWithString: label)
-        titleLabel.frame = NSRect(x: 20, y: y, width: 200, height: 20)
-        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        view.addSubview(titleLabel)
-
-        let slider = NSSlider(frame: NSRect(x: 20, y: y - 30, width: 260, height: 20))
-        slider.minValue = Double(min)
-        slider.maxValue = Double(max)
-        slider.integerValue = value
-        slider.target = self
-        slider.action = action
-        slider.isContinuous = true
-        view.addSubview(slider)
-        sliderOut = slider
-
-        let valLabel = NSTextField(labelWithString: format(value))
-        valLabel.frame = NSRect(x: 290, y: y - 30, width: 70, height: 20)
-        valLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        valLabel.alignment = .right
-        view.addSubview(valLabel)
-        labelOut = valLabel
-
-        return y - 70
-    }
-
-    @objc private func awaySliderChanged() {
-        awayLabel.stringValue = formatDuration(awaySlider.integerValue)
-    }
-    @objc private func faceSliderChanged() {
-        faceLabel.stringValue = formatDuration(faceSlider.integerValue)
-    }
-    @objc private func staleSliderChanged() {
-        staleLabel.stringValue = formatDuration(staleSlider.integerValue)
+    @objc private func sliderChanged(_ sender: NSSlider) {
+        for (s, sl, lbl) in sliders where sl === sender {
+            lbl.stringValue = formatForSetting(s, sl.integerValue)
+            break
+        }
     }
 
     @objc private func applySettings() {
-        let away = awaySlider.integerValue
-        let face = faceSlider.integerValue
-        let stale = staleSlider.integerValue
-
-        // Save to UserDefaults
         let defaults = UserDefaults.standard
-        defaults.set(away, forKey: kAwayIdle)
-        defaults.set(face, forKey: kFaceSample)
-        defaults.set(stale, forKey: kStale)
 
-        // Update daemon plist with new env vars
-        updateDaemonPlist(awayIdle: away, faceSample: face, stale: stale)
+        // Read the current plist
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
+              var plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              var env = plist["EnvironmentVariables"] as? [String: String] else {
+            showAlert("Could not read daemon plist at:\n\(daemonPlist)")
+            return
+        }
 
-        // Restart daemon
+        // Write slider values
+        for (s, slider, _) in sliders {
+            let value = slider.integerValue
+            defaults.set(value, forKey: s.key)
+
+            switch s.unit {
+            case .seconds:
+                env[s.envVar] = String(value)
+            case .milliseconds:
+                if s.key == "overrideTtlMinutes" {
+                    env[s.envVar] = String(value * 60 * 1000) // minutes → ms
+                } else {
+                    env[s.envVar] = String(value * 1000)  // seconds → ms
+                }
+            }
+        }
+
+        // Write toggle values
+        for (t, btn) in toggleButtons {
+            let on = btn.state == .on
+            defaults.set(on, forKey: t.key)
+            env[t.envVar] = on ? "on" : "off"
+        }
+
+        plist["EnvironmentVariables"] = env
+
+        // Write plist back
+        if let newData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            do {
+                try newData.write(to: URL(fileURLWithPath: daemonPlist))
+            } catch {
+                showAlert("Could not write plist: \(error.localizedDescription)")
+                return
+            }
+        }
+
+        // Restart daemon (unload + load to pick up plist changes)
         appDelegate?.restartDaemonAction()
-
         window?.close()
     }
 
-    private func updateDaemonPlist(awayIdle: Int, faceSample: Int, stale: Int) {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
-              var plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              var env = plist["EnvironmentVariables"] as? [String: String] else { return }
-
-        env["TG_RELAY_AWAY_IDLE_SECONDS"] = String(awayIdle)
-        env["TG_RELAY_FACE_SAMPLE_MS"] = String(faceSample * 1000)
-        env["TG_RELAY_STALE_SECONDS"] = String(stale)
-        plist["EnvironmentVariables"] = env
-
-        if let newData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-            try? newData.write(to: URL(fileURLWithPath: daemonPlist))
+    private func formatForSetting(_ s: Setting, _ value: Int) -> String {
+        if s.key == "overrideTtlMinutes" {
+            return "\(value) min"
         }
+        return formatDuration(value)
+    }
+
+    private func showAlert(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Settings Error"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 }
 
@@ -221,11 +294,8 @@ private func formatDuration(_ seconds: Int) -> String {
     return s == 0 ? "\(m)m" : "\(m)m \(s)s"
 }
 
-extension Int {
-    func clamped(_ lo: Int, _ hi: Int, _ fallback: Int) -> Int {
-        let v = self == 0 ? fallback : self
-        return Swift.min(Swift.max(v, lo), hi)
-    }
+private func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int {
+    return Swift.min(Swift.max(v, lo), hi)
 }
 
 // MARK: - App Delegate
@@ -411,9 +481,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.poll() }
     }
 
-    @objc private func restartDaemon() {
-        restartDaemonAction()
-    }
+    @objc private func restartDaemon() { restartDaemonAction() }
 
     func restartDaemonAction() {
         // Unload + load picks up plist changes (kickstart doesn't)
