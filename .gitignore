@@ -11,3 +11,5 @@ tts/__pycache__/
 .mcp.json
 tools/presence-menubar/PresenceMenuBar
 tools/presence-camera/FaceDetect
+tools/presence-menubar/PresenceMonitor.app/
+tools/presence-menubar/PresenceMonitor

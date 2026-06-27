@@ -1,17 +1,18 @@
 /**
- * Presence menubar app — macOS status-bar indicator for tg-relay presence.
+ * Presence Monitor — macOS menubar app for tg-relay presence.
  *
  * Shows 🟢 (present), 🔴 (away), ⚠️ (stale), or ❓ (unreachable) in the
- * menubar. Dropdown shows state details, daemon status, and lets you:
- * - Toggle /here /away overrides via the daemon's HTTP API
- * - Start / Stop / Restart the tg-relay daemon (via launchctl)
+ * menubar. Features:
+ * - Presence status display with override controls (here/away)
+ * - Daemon management (start/stop/restart via launchctl)
+ * - Settings window with sliders for presence thresholds
  *
- * Usage:
- *   swiftc -o PresenceMenuBar PresenceMenuBar.swift -framework Cocoa && ./PresenceMenuBar
+ * Build as .app:
+ *   ./build.sh
  *
  * Environment:
  *   PRESENCE_URL    — daemon endpoint (default: http://localhost:7780)
- *   PRESENCE_TOKEN  — bearer token for override actions (same as daemon's TG_RELAY_PRESENCE_TOKEN)
+ *   PRESENCE_TOKEN  — bearer token for override actions
  */
 
 import Cocoa
@@ -25,8 +26,16 @@ let pollInterval: TimeInterval = 5.0
 
 let daemonLabel = "com.marknutter.tg-relay"
 let daemonPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(daemonLabel).plist"
-let menubarLabel = "com.marknutter.presence-menubar"
-let menubarPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(menubarLabel).plist"
+
+// MARK: - Settings keys (UserDefaults)
+
+let kAwayIdle   = "awayIdleSeconds"      // How long idle before → away
+let kFaceSample = "faceSampleSeconds"    // Camera check interval
+let kStale      = "staleSeconds"         // When state is considered stale
+
+let defaultAwayIdle   = 90
+let defaultFaceSample = 15
+let defaultStale      = 45
 
 // MARK: - State model
 
@@ -41,6 +50,184 @@ struct PresenceStatus {
     let overrideExpiresIn: Int?
 }
 
+// MARK: - Settings Window
+
+class SettingsWindowController: NSObject {
+    private var window: NSWindow?
+    private var awaySlider: NSSlider!
+    private var awayLabel: NSTextField!
+    private var faceSlider: NSSlider!
+    private var faceLabel: NSTextField!
+    private var staleSlider: NSSlider!
+    private var staleLabel: NSTextField!
+    private weak var appDelegate: AppDelegate?
+
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
+        super.init()
+    }
+
+    func show() {
+        if let w = window {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 280),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "Presence Settings"
+        w.center()
+        w.isReleasedWhenClosed = false
+
+        let content = NSView(frame: w.contentView!.bounds)
+        content.autoresizingMask = [.width, .height]
+
+        let defaults = UserDefaults.standard
+        var y: CGFloat = 230
+
+        // Away idle threshold
+        y = addSliderRow(
+            to: content, y: y,
+            label: "Go away after idle:",
+            min: 30, max: 600, value: defaults.integer(forKey: kAwayIdle).clamped(30, 600, defaultAwayIdle),
+            format: { formatDuration($0) },
+            sliderOut: &awaySlider, labelOut: &awayLabel,
+            action: #selector(awaySliderChanged)
+        )
+
+        // Face sample interval
+        y = addSliderRow(
+            to: content, y: y,
+            label: "Camera check interval:",
+            min: 5, max: 120, value: defaults.integer(forKey: kFaceSample).clamped(5, 120, defaultFaceSample),
+            format: { formatDuration($0) },
+            sliderOut: &faceSlider, labelOut: &faceLabel,
+            action: #selector(faceSliderChanged)
+        )
+
+        // Stale threshold
+        y = addSliderRow(
+            to: content, y: y,
+            label: "Stale after:",
+            min: 30, max: 300, value: defaults.integer(forKey: kStale).clamped(30, 300, defaultStale),
+            format: { formatDuration($0) },
+            sliderOut: &staleSlider, labelOut: &staleLabel,
+            action: #selector(staleSliderChanged)
+        )
+
+        // Apply button
+        let applyBtn = NSButton(frame: NSRect(x: 130, y: 15, width: 120, height: 32))
+        applyBtn.title = "Apply & Restart"
+        applyBtn.bezelStyle = .rounded
+        applyBtn.target = self
+        applyBtn.action = #selector(applySettings)
+        content.addSubview(applyBtn)
+
+        w.contentView = content
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window = w
+    }
+
+    private func addSliderRow(
+        to view: NSView, y: CGFloat,
+        label: String,
+        min: Int, max: Int, value: Int,
+        format: @escaping (Int) -> String,
+        sliderOut: inout NSSlider!,
+        labelOut: inout NSTextField!,
+        action: Selector
+    ) -> CGFloat {
+        let titleLabel = NSTextField(labelWithString: label)
+        titleLabel.frame = NSRect(x: 20, y: y, width: 200, height: 20)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        view.addSubview(titleLabel)
+
+        let slider = NSSlider(frame: NSRect(x: 20, y: y - 30, width: 260, height: 20))
+        slider.minValue = Double(min)
+        slider.maxValue = Double(max)
+        slider.integerValue = value
+        slider.target = self
+        slider.action = action
+        slider.isContinuous = true
+        view.addSubview(slider)
+        sliderOut = slider
+
+        let valLabel = NSTextField(labelWithString: format(value))
+        valLabel.frame = NSRect(x: 290, y: y - 30, width: 70, height: 20)
+        valLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        valLabel.alignment = .right
+        view.addSubview(valLabel)
+        labelOut = valLabel
+
+        return y - 70
+    }
+
+    @objc private func awaySliderChanged() {
+        awayLabel.stringValue = formatDuration(awaySlider.integerValue)
+    }
+    @objc private func faceSliderChanged() {
+        faceLabel.stringValue = formatDuration(faceSlider.integerValue)
+    }
+    @objc private func staleSliderChanged() {
+        staleLabel.stringValue = formatDuration(staleSlider.integerValue)
+    }
+
+    @objc private func applySettings() {
+        let away = awaySlider.integerValue
+        let face = faceSlider.integerValue
+        let stale = staleSlider.integerValue
+
+        // Save to UserDefaults
+        let defaults = UserDefaults.standard
+        defaults.set(away, forKey: kAwayIdle)
+        defaults.set(face, forKey: kFaceSample)
+        defaults.set(stale, forKey: kStale)
+
+        // Update daemon plist with new env vars
+        updateDaemonPlist(awayIdle: away, faceSample: face, stale: stale)
+
+        // Restart daemon
+        appDelegate?.restartDaemonAction()
+
+        window?.close()
+    }
+
+    private func updateDaemonPlist(awayIdle: Int, faceSample: Int, stale: Int) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
+              var plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              var env = plist["EnvironmentVariables"] as? [String: String] else { return }
+
+        env["TG_RELAY_AWAY_IDLE_SECONDS"] = String(awayIdle)
+        env["TG_RELAY_FACE_SAMPLE_MS"] = String(faceSample * 1000)
+        env["TG_RELAY_STALE_SECONDS"] = String(stale)
+        plist["EnvironmentVariables"] = env
+
+        if let newData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? newData.write(to: URL(fileURLWithPath: daemonPlist))
+        }
+    }
+}
+
+private func formatDuration(_ seconds: Int) -> String {
+    if seconds < 60 { return "\(seconds)s" }
+    let m = seconds / 60
+    let s = seconds % 60
+    return s == 0 ? "\(m)m" : "\(m)m \(s)s"
+}
+
+extension Int {
+    func clamped(_ lo: Int, _ hi: Int, _ fallback: Int) -> Int {
+        let v = self == 0 ? fallback : self
+        return Swift.min(Swift.max(v, lo), hi)
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -48,6 +235,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var lastStatus: PresenceStatus?
     private var daemonRunning: Bool = false
+    private var settingsController: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -62,7 +250,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Polling
 
     private func poll() {
-        // Check daemon status
         daemonRunning = isDaemonRunning()
 
         guard let url = URL(string: "\(baseURL)/presence") else {
@@ -105,13 +292,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if !daemonRunning {
                 addDisabled(menu, "⛔ Daemon is not running")
             } else {
-                addDisabled(menu, "Daemon is running but endpoint not reachable")
+                addDisabled(menu, "Daemon running but endpoint not reachable")
             }
             addDisabled(menu, "\(baseURL)/presence")
             menu.addItem(NSMenuItem.separator())
             addDaemonControls(menu)
             menu.addItem(NSMenuItem.separator())
-            addQuit(menu)
+            addSettingsAndQuit(menu)
             statusItem.menu = menu
             return
         }
@@ -165,12 +352,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
-
-        // Daemon controls
         addDaemonControls(menu)
-
         menu.addItem(NSMenuItem.separator())
-        addQuit(menu)
+        addSettingsAndQuit(menu)
 
         statusItem.menu = menu
     }
@@ -194,18 +378,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func addSettingsAndQuit(_ menu: NSMenu) {
+        let settingsItem = NSMenuItem(title: "⚙️  Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        let quitItem = NSMenuItem(title: "Quit Presence Monitor", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+    }
+
     // MARK: - Actions
 
-    @objc private func setHere() {
-        postOverride(present: true)
-    }
+    @objc private func setHere() { postOverride(present: true) }
+    @objc private func setAway() { postOverride(present: false) }
+    @objc private func clearOverride() { deleteOverride() }
 
-    @objc private func setAway() {
-        postOverride(present: false)
-    }
-
-    @objc private func clearOverride() {
-        deleteOverride()
+    @objc private func openSettings() {
+        if settingsController == nil {
+            settingsController = SettingsWindowController(appDelegate: self)
+        }
+        settingsController?.show()
     }
 
     @objc private func startDaemon() {
@@ -219,15 +412,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func restartDaemon() {
-        // kickstart -k restarts in-place using the CURRENT plist
-        let uid = getuid()
-        runLaunchctl(["kickstart", "-k", "gui/\(uid)/\(daemonLabel)"])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
+        restartDaemonAction()
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
+    func restartDaemonAction() {
+        // Unload + load picks up plist changes (kickstart doesn't)
+        runLaunchctl(["unload", daemonPlist])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            self.runLaunchctl(["load", daemonPlist])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
+        }
     }
+
+    @objc private func quit() { NSApp.terminate(nil) }
 
     // MARK: - Daemon helpers
 
@@ -269,7 +466,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["present": present])
         URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
-            // Re-poll immediately so the UI updates.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.poll() }
         }.resume()
     }
@@ -292,12 +488,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         menu.addItem(item)
-    }
-
-    private func addQuit(_ menu: NSMenu) {
-        let quitItem = NSMenuItem(title: "Quit Presence Monitor", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
     }
 
     private func formatAge(_ seconds: Int) -> String {
