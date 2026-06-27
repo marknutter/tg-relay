@@ -22,7 +22,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { existsSync, realpathSync, readFileSync, statSync, appendFileSync } from 'fs'
+import { existsSync, realpathSync, readFileSync, writeFileSync, statSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { execFileSync } from 'child_process'
@@ -331,6 +331,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ...(voice ? { voice: true } : {}),
         }
         socketWrite(JSON.stringify(msg) + '\n')
+        // Touch marker for the stop hook (guard-telegram-reply.sh)
+        try { writeFileSync(join(stateDir, '.reply_sent'), String(Date.now())) } catch {}
         return { content: [{ type: 'text', text: voice ? 'sent (voice)' : 'sent' }] }
       }
 
