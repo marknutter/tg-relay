@@ -296,16 +296,28 @@ export async function readFaceDetected(binPath?: string): Promise<boolean | null
   try {
     const proc = Bun.spawn([bin], {
       stdout: 'pipe',
-      stderr: 'ignore',
+      stderr: 'pipe',
     })
     // 5s timeout — if the binary hangs, kill it and return null.
     const timeout = setTimeout(() => proc.kill(), 5000)
-    const text = await new Response(proc.stdout).text()
+    const [text, errText] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
     clearTimeout(timeout)
-    await proc.exited
-    const result = JSON.parse(text.trim())
+    const exitCode = await proc.exited
+    const trimmed = text.trim()
+    if (!trimmed) {
+      console.error(`[presence] FaceDetect returned empty output (exit=${exitCode}, bin=${bin}, stderr=${errText.trim().slice(0, 200)})`)
+      return null
+    }
+    const result = JSON.parse(trimmed)
+    if (result.error) {
+      console.error(`[presence] FaceDetect error: ${result.error} (exit=${exitCode}, bin=${bin})`)
+    }
     return typeof result.faceDetected === 'boolean' ? result.faceDetected : null
-  } catch {
+  } catch (err) {
+    console.error(`[presence] FaceDetect failed: ${err} (bin=${bin})`)
     return null  // binary missing, crashed, timed out → fail-soft
   }
 }
