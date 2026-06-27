@@ -47,6 +47,7 @@ const NULL_SIGNALS: PresenceSignals = {
   displayAsleep: null,
   clamshellClosed: null,
   videoCallActive: null,
+  faceDetected: null,
 }
 
 /** Convenience: signals with only HID idle set, everything else null→false. */
@@ -111,6 +112,7 @@ describe('computePresence', () => {
         displayAsleep: false,
         clamshellClosed: false,
         videoCallActive: true,
+        faceDetected: true,
       }
       const result = computePresence(signals, PREV_PRESENT, override, THRESHOLDS, NOW)
       expect(result.present).toBe(false)
@@ -196,6 +198,64 @@ describe('computePresence', () => {
         videoCallActive: true,
       }
       const result = computePresence(signals, PREV_PRESENT, null, THRESHOLDS, NOW)
+      expect(result.present).toBe(false)
+    })
+  })
+
+  // ─── rule 3: face detection (issue #87) ───────────────────────────────
+
+  describe('face detection (rule 3)', () => {
+    test('faceDetected=true → present, even with HID idle > awayIdleSeconds', () => {
+      const signals: PresenceSignals = {
+        ...NULL_SIGNALS,
+        hidIdleSeconds: 200,
+        screenLocked: false,
+        displayAsleep: false,
+        clamshellClosed: false,
+        faceDetected: true,
+      }
+      const result = computePresence(signals, PREV_AWAY, null, THRESHOLDS, NOW)
+      expect(result.present).toBe(true)
+    })
+
+    test('faceDetected=true in hysteresis zone → present (not just holding prev)', () => {
+      const signals: PresenceSignals = {
+        ...NULL_SIGNALS,
+        hidIdleSeconds: 60,  // hysteresis zone (30-90)
+        faceDetected: true,
+      }
+      const result = computePresence(signals, PREV_AWAY, null, THRESHOLDS, NOW)
+      expect(result.present).toBe(true)
+    })
+
+    test('screenLocked + faceDetected → rule 2 wins (hard-away beats face)', () => {
+      const signals: PresenceSignals = {
+        ...NULL_SIGNALS,
+        hidIdleSeconds: 5,
+        screenLocked: true,
+        faceDetected: true,
+      }
+      const result = computePresence(signals, PREV_PRESENT, null, THRESHOLDS, NOW)
+      expect(result.present).toBe(false)
+    })
+
+    test('faceDetected=null → no effect (treated as false)', () => {
+      const signals: PresenceSignals = {
+        ...NULL_SIGNALS,
+        hidIdleSeconds: 200,
+        faceDetected: null,
+      }
+      const result = computePresence(signals, PREV_AWAY, null, THRESHOLDS, NOW)
+      expect(result.present).toBe(false)  // away because idle > 90 and no face override
+    })
+
+    test('faceDetected=false → no override, falls through to idle logic', () => {
+      const signals: PresenceSignals = {
+        ...NULL_SIGNALS,
+        hidIdleSeconds: 200,
+        faceDetected: false,
+      }
+      const result = computePresence(signals, PREV_AWAY, null, THRESHOLDS, NOW)
       expect(result.present).toBe(false)
     })
   })

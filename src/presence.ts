@@ -1,7 +1,7 @@
 /**
- * Presence detection (issue #86): determine whether Mark is at his laptop
- * so the daemon can suppress redundant Telegram notifications when he's
- * already in front of the screen.
+ * Presence detection (issues #86, #87): determine whether Mark is at his
+ * laptop so the daemon can suppress redundant Telegram notifications when
+ * he's already in front of the screen.
  *
  * Fail-safe principle: **send by default; suppress only on confident, fresh
  * presence.** Anything uncertain — stale data, unreachable endpoint, a
@@ -19,6 +19,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import path from 'node:path'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -62,6 +63,21 @@ export const OVERRIDE_TTL_MS = parseInt(process.env.TG_RELAY_PRESENCE_OVERRIDE_T
 /** Timeout for remote GET /presence fetches (ms). */
 const FETCH_TIMEOUT_MS = parseInt(process.env.TG_RELAY_PRESENCE_FETCH_TIMEOUT_MS ?? '3000', 10)
 
+/**
+ * Camera-based face detection (issue #87). When 'on', the producer samples
+ * the camera in the ambiguous zone (unlocked + awake + HID idle > present
+ * threshold) to detect if a face is visible. Resolves the at-desk-reading
+ * false-away problem.
+ */
+export const PRESENCE_CAMERA = (process.env.TG_RELAY_PRESENCE_CAMERA ?? 'off').toLowerCase() === 'on'
+
+/** Minimum interval between camera samples (ms). Keeps power use low. */
+export const FACE_SAMPLE_MS = parseInt(process.env.TG_RELAY_FACE_SAMPLE_MS ?? '15000', 10)
+
+/** Path to the FaceDetect Swift binary. */
+export const FACE_DETECT_BIN = process.env.TG_RELAY_FACE_DETECT_BIN ??
+  path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'tools', 'presence-camera', 'FaceDetect')
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /** Raw signals from macOS — each null when the reader couldn't obtain it. */
@@ -71,6 +87,7 @@ export type PresenceSignals = {
   displayAsleep: boolean | null
   clamshellClosed: boolean | null
   videoCallActive: boolean | null
+  faceDetected: boolean | null
 }
 
 /** In-memory presence state updated by the producer tick or POST /presence. */
@@ -108,7 +125,7 @@ export function initialPresenceState(): PresenceState {
  * Rules (fail-safe to away / send):
  * 1. Active override → return override.present.
  * 2. Screen locked / display asleep / clamshell closed → away.
- * 3. Video call active → present (even with high HID idle).
+ * 3. Video call active OR face detected → present (even with high HID idle).
  * 4. HID idle < presentIdleSeconds → present.
  * 5. HID idle > awayIdleSeconds → away.
  * 6. Between thresholds → hold prev.present (hysteresis).
@@ -134,14 +151,15 @@ export function computePresence(
   const asleep = signals.displayAsleep === true
   const clamshell = signals.clamshellClosed === true
   const videoCall = signals.videoCallActive === true
+  const faceVisible = signals.faceDetected === true
 
   // Rule 2: hard-away signals.
   if (locked || asleep || clamshell) {
     return { present: false }
   }
 
-  // Rule 3: video call → present regardless of idle.
-  if (videoCall) {
+  // Rule 3: video call or face detected → present regardless of idle.
+  if (videoCall || faceVisible) {
     return { present: true }
   }
 
@@ -262,8 +280,41 @@ export function readVideoCallActive(): boolean | null {
 }
 
 /**
- * Read all macOS presence signals. Never throws — each reader fails
- * independently to null.
+ * Whether a face is detected via the camera (issue #87).
+ *
+ * Calls the FaceDetect Swift binary which opens the camera, grabs one
+ * low-res frame, runs VNDetectFaceRectanglesRequest, and prints JSON.
+ * Returns null on any failure (camera denied, busy, timeout, binary
+ * missing). The caller is responsible for only invoking this in the
+ * ambiguous zone (unlocked + awake + HID idle past present threshold).
+ *
+ * This is async because the Swift binary takes 1-3s (camera warm-up +
+ * frame capture + Vision inference).
+ */
+export async function readFaceDetected(binPath?: string): Promise<boolean | null> {
+  const bin = binPath ?? FACE_DETECT_BIN
+  try {
+    const proc = Bun.spawn([bin], {
+      stdout: 'pipe',
+      stderr: 'ignore',
+    })
+    // 5s timeout — if the binary hangs, kill it and return null.
+    const timeout = setTimeout(() => proc.kill(), 5000)
+    const text = await new Response(proc.stdout).text()
+    clearTimeout(timeout)
+    await proc.exited
+    const result = JSON.parse(text.trim())
+    return typeof result.faceDetected === 'boolean' ? result.faceDetected : null
+  } catch {
+    return null  // binary missing, crashed, timed out → fail-soft
+  }
+}
+
+/**
+ * Read all macOS presence signals (cheap / synchronous ones).
+ * Face detection is NOT included here — it's async and conditional.
+ * The daemon's presenceTick calls readFaceDetected separately when
+ * the camera signal would add value.
  */
 export function readAllSignals(): PresenceSignals {
   return {
@@ -272,6 +323,7 @@ export function readAllSignals(): PresenceSignals {
     displayAsleep: readDisplayAsleep(),
     clamshellClosed: readClamshellClosed(),
     videoCallActive: readVideoCallActive(),
+    faceDetected: null,  // populated by presenceTick when camera is enabled
   }
 }
 

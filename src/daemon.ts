@@ -51,13 +51,14 @@ import {
   normalizeOutboundMode, defaultReplyChatId,
 } from './antigravity.js'
 import {
-  computePresence, readAllSignals, presenceShouldSend,
+  computePresence, readAllSignals, readFaceDetected, presenceShouldSend,
   fetchRemotePresence, buildPresenceResponse, validatePostPresence,
   initialPresenceState,
   PRESENCE_TICK_MS, PRESENT_IDLE_SECONDS, AWAY_IDLE_SECONDS,
   PRESENCE_STALE_SECONDS, PRESENCE_GATING, PRESENCE_PORT,
   PRESENCE_TOKEN, PRESENCE_PRODUCER, PRESENCE_LAPTOP_URL,
   PRESENCE_CACHE_MS, OVERRIDE_TTL_MS,
+  PRESENCE_CAMERA, FACE_SAMPLE_MS,
   type PresenceState, type PresenceOverride,
 } from './presence.js'
 import type {
@@ -451,6 +452,8 @@ type PresenceRuntime = {
   httpServer?: ReturnType<typeof Bun.serve>
   /** Consumer cache: avoid re-fetching presence on every send in a burst. */
   cachedShouldSend: { value: boolean; ts: number } | null
+  /** Timestamp of the last camera face sample (ms). Throttles sampling to FACE_SAMPLE_MS. */
+  lastFaceSampleTs: number
 }
 
 let presenceRuntime: PresenceRuntime | null = null
@@ -1667,6 +1670,27 @@ async function presenceTick(): Promise<void> {
   rt.ticking = true
   try {
     const signals = readAllSignals()
+
+    // Camera face detection (#87): only sample when it would add value.
+    // Skip when: camera disabled, locked, asleep, clamshell shut, on a
+    // video call (camera busy), HID idle below present threshold (already
+    // definitely present), or too soon since last sample.
+    if (
+      PRESENCE_CAMERA &&
+      signals.screenLocked !== true &&
+      signals.displayAsleep !== true &&
+      signals.clamshellClosed !== true &&
+      signals.videoCallActive !== true &&
+      (signals.hidIdleSeconds ?? Infinity) >= PRESENT_IDLE_SECONDS &&
+      (Date.now() - rt.lastFaceSampleTs) >= FACE_SAMPLE_MS
+    ) {
+      signals.faceDetected = await readFaceDetected()
+      rt.lastFaceSampleTs = Date.now()
+      if (signals.faceDetected !== null) {
+        logGlobal(`presence: face sample → ${signals.faceDetected ? 'detected' : 'no face'}`)
+      }
+    }
+
     const { present } = computePresence(
       signals,
       rt.state,
@@ -1691,6 +1715,7 @@ function startPresence(): void {
     ticking: false,
     timer: setInterval(() => { void presenceTick() }, PRESENCE_TICK_MS),
     cachedShouldSend: null,
+    lastFaceSampleTs: 0,
   }
   presenceRuntime = rt
 
@@ -1810,7 +1835,8 @@ function startPresence(): void {
 
   logGlobal(
     `presence: started (gating=${PRESENCE_GATING}, producer=${PRESENCE_PRODUCER}, ` +
-    `tick=${PRESENCE_TICK_MS}ms, present<${PRESENT_IDLE_SECONDS}s, away>${AWAY_IDLE_SECONDS}s, ` +
+    `camera=${PRESENCE_CAMERA}, tick=${PRESENCE_TICK_MS}ms, face_sample=${FACE_SAMPLE_MS}ms, ` +
+    `present<${PRESENT_IDLE_SECONDS}s, away>${AWAY_IDLE_SECONDS}s, ` +
     `stale>${PRESENCE_STALE_SECONDS}s)`,
   )
 }

@@ -10,3 +10,4 @@ tts/__pycache__/
 # plugin (see install.sh / install.ps1), not a committed project .mcp.json.
 .mcp.json
 tools/presence-menubar/PresenceMenuBar
+tools/presence-camera/FaceDetect
