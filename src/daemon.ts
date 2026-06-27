@@ -454,6 +454,8 @@ type PresenceRuntime = {
   cachedShouldSend: { value: boolean; ts: number } | null
   /** Timestamp of the last camera face sample (ms). Throttles sampling to FACE_SAMPLE_MS. */
   lastFaceSampleTs: number
+  /** Cached result of the last face detection. Reused between samples to avoid flicker. */
+  lastFaceResult: boolean | null
 }
 
 let presenceRuntime: PresenceRuntime | null = null
@@ -1685,9 +1687,20 @@ async function presenceTick(): Promise<void> {
       (Date.now() - rt.lastFaceSampleTs) >= FACE_SAMPLE_MS
     ) {
       signals.faceDetected = await readFaceDetected()
+      rt.lastFaceResult = signals.faceDetected
       rt.lastFaceSampleTs = Date.now()
       if (signals.faceDetected !== null) {
         logGlobal(`presence: face sample → ${signals.faceDetected ? 'detected' : 'no face'}`)
+      }
+    } else if (PRESENCE_CAMERA && rt.lastFaceResult !== null) {
+      // Between samples: carry forward the last result so presence doesn't
+      // flicker (green on sample tick, red on non-sample ticks). Expire the
+      // cache at 2× the sample interval as a safety net.
+      const faceAge = Date.now() - rt.lastFaceSampleTs
+      if (faceAge < FACE_SAMPLE_MS * 2) {
+        signals.faceDetected = rt.lastFaceResult
+      } else {
+        rt.lastFaceResult = null  // stale → clear
       }
     }
 
@@ -1716,6 +1729,7 @@ function startPresence(): void {
     timer: setInterval(() => { void presenceTick() }, PRESENCE_TICK_MS),
     cachedShouldSend: null,
     lastFaceSampleTs: 0,
+    lastFaceResult: null,
   }
   presenceRuntime = rt
 
