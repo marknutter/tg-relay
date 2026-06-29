@@ -20,6 +20,7 @@
 
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
+import fs from 'node:fs'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -74,9 +75,13 @@ export const PRESENCE_CAMERA = (process.env.TG_RELAY_PRESENCE_CAMERA ?? 'off').t
 /** Minimum interval between camera samples (ms). Keeps power use low. */
 export const FACE_SAMPLE_MS = parseInt(process.env.TG_RELAY_FACE_SAMPLE_MS ?? '15000', 10)
 
-/** Path to the PresenceDetect binary. Uses the .app bundle for TCC camera permissions. */
-export const FACE_DETECT_BIN = process.env.TG_RELAY_FACE_DETECT_BIN ??
-  path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'tools', 'presence-camera', 'PresenceDetect.app', 'Contents', 'MacOS', 'PresenceDetect')
+/** Path to the PresenceDetect binary. Prefers /Applications install (stable across Mutagen syncs). */
+export const FACE_DETECT_BIN = process.env.TG_RELAY_FACE_DETECT_BIN ?? (() => {
+  const appPath = '/Applications/PresenceDetect.app/Contents/MacOS/PresenceDetect'
+  const treePath = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'tools', 'presence-camera', 'PresenceDetect.app', 'Contents', 'MacOS', 'PresenceDetect')
+  try { fs.accessSync(appPath, fs.constants.X_OK); return appPath } catch {}
+  return treePath
+})()
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
