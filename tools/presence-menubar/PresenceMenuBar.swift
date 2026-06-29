@@ -1,18 +1,17 @@
 /**
- * Presence Monitor — macOS menubar app for tg-relay presence.
+ * Presence Monitor — all-in-one macOS menubar app for tg-relay.
  *
- * Shows 🟢 (present), 🔴 (away), ⚠️ (stale), or ❓ (unreachable) in the
- * menubar. Features:
- * - Presence status display with override controls (here/away)
- * - Daemon management (start/stop/restart via launchctl)
- * - Settings window with sliders and toggles for presence thresholds
+ * This single app:
+ * 1. Launches and manages the tg-relay daemon as a child process
+ * 2. Shows 🟢/🔴/⚠️/❓ presence in the menubar
+ * 3. Provides override controls (here/away)
+ * 4. Settings window with sliders/toggles for all thresholds
  *
- * Build as .app:
- *   ./build.sh
+ * Build:  ./build.sh
+ * Output: PresenceMonitor.app (drag to /Applications, add to Login Items)
  *
  * Environment:
- *   PRESENCE_URL    — daemon endpoint (default: http://localhost:7780)
- *   PRESENCE_TOKEN  — bearer token for override actions
+ *   PRESENCE_TOKEN — bearer token for override API (default: reads from UserDefaults)
  */
 
 import Cocoa
@@ -20,19 +19,30 @@ import Foundation
 
 // MARK: - Configuration
 
-let baseURL = ProcessInfo.processInfo.environment["PRESENCE_URL"] ?? "http://localhost:7780"
-let token   = ProcessInfo.processInfo.environment["PRESENCE_TOKEN"] ?? ""
 let pollInterval: TimeInterval = 5.0
+let presencePort = 7780
+let baseURL = "http://localhost:\(presencePort)"
 
 let daemonLabel = "com.marknutter.tg-relay"
-let daemonPlist = "\(NSHomeDirectory())/Library/LaunchAgents/\(daemonLabel).plist"
 
-// MARK: - Settings keys and defaults (UserDefaults + env var mapping)
+// Paths — these are MacBook Pro specific
+let bunBin: String = {
+    // Try common locations
+    for p in ["/opt/homebrew/bin/bun", "/usr/local/bin/bun",
+              "\(NSHomeDirectory())/.bun/bin/bun"] {
+        if FileManager.default.fileExists(atPath: p) { return p }
+    }
+    return "/opt/homebrew/bin/bun"  // fallback
+}()
+let daemonScript = "\(NSHomeDirectory())/Code/tg-relay/src/daemon.ts"
+let logFile = "\(NSHomeDirectory())/.claude/channels/telegram-router.log"
 
-struct Setting {
-    let key: String       // UserDefaults key
-    let envVar: String    // Daemon env var name
-    let label: String     // UI label
+// MARK: - Settings keys and defaults
+
+struct SliderSetting {
+    let key: String
+    let envVar: String
+    let label: String
     let unit: SettingUnit
     let min: Int
     let max: Int
@@ -40,43 +50,44 @@ struct Setting {
 }
 
 enum SettingUnit {
-    case seconds      // stored as seconds, env var as seconds
-    case milliseconds // stored as seconds in UI, env var as milliseconds
+    case seconds
+    case milliseconds  // UI shows seconds, env var is ms
+    case minutes       // UI shows minutes, env var is ms
 }
 
-let sliderSettings: [Setting] = [
-    Setting(key: "awayIdleSeconds", envVar: "TG_RELAY_AWAY_IDLE_SECONDS",
-            label: "Go away after idle",
-            unit: .seconds, min: 15, max: 600, defaultValue: 90),
-    Setting(key: "presentIdleSeconds", envVar: "TG_RELAY_PRESENT_IDLE_SECONDS",
-            label: "Return to present after activity",
-            unit: .seconds, min: 5, max: 120, defaultValue: 30),
-    Setting(key: "faceSampleSeconds", envVar: "TG_RELAY_FACE_SAMPLE_MS",
-            label: "Face scan interval",
-            unit: .milliseconds, min: 5, max: 120, defaultValue: 15),
-    Setting(key: "presenceTickSeconds", envVar: "TG_RELAY_PRESENCE_TICK_MS",
-            label: "Presence poll interval",
-            unit: .milliseconds, min: 3, max: 60, defaultValue: 10),
-    Setting(key: "staleSeconds", envVar: "TG_RELAY_PRESENCE_STALE_SECONDS",
-            label: "Mark stale after",
-            unit: .seconds, min: 15, max: 300, defaultValue: 45),
-    Setting(key: "overrideTtlMinutes", envVar: "TG_RELAY_PRESENCE_OVERRIDE_TTL_MS",
-            label: "Override duration",
-            unit: .milliseconds, min: 5, max: 120, defaultValue: 30),
+let sliderSettings: [SliderSetting] = [
+    SliderSetting(key: "awayIdleSeconds", envVar: "TG_RELAY_AWAY_IDLE_SECONDS",
+                  label: "Go away after idle",
+                  unit: .seconds, min: 15, max: 600, defaultValue: 90),
+    SliderSetting(key: "presentIdleSeconds", envVar: "TG_RELAY_PRESENT_IDLE_SECONDS",
+                  label: "Return to present after activity",
+                  unit: .seconds, min: 5, max: 120, defaultValue: 30),
+    SliderSetting(key: "faceSampleSeconds", envVar: "TG_RELAY_FACE_SAMPLE_MS",
+                  label: "Face scan interval",
+                  unit: .milliseconds, min: 5, max: 120, defaultValue: 15),
+    SliderSetting(key: "presenceTickSeconds", envVar: "TG_RELAY_PRESENCE_TICK_MS",
+                  label: "Presence poll interval",
+                  unit: .milliseconds, min: 3, max: 60, defaultValue: 10),
+    SliderSetting(key: "staleSeconds", envVar: "TG_RELAY_PRESENCE_STALE_SECONDS",
+                  label: "Mark stale after",
+                  unit: .seconds, min: 15, max: 300, defaultValue: 45),
+    SliderSetting(key: "overrideTtlMinutes", envVar: "TG_RELAY_PRESENCE_OVERRIDE_TTL_MS",
+                  label: "Override duration",
+                  unit: .minutes, min: 5, max: 120, defaultValue: 30),
 ]
 
-struct Toggle {
+struct ToggleSetting {
     let key: String
     let envVar: String
     let label: String
     let defaultValue: Bool
 }
 
-let toggleSettings: [Toggle] = [
-    Toggle(key: "camera", envVar: "TG_RELAY_PRESENCE_CAMERA",
-           label: "Face detection (camera)", defaultValue: true),
-    Toggle(key: "gating", envVar: "TG_RELAY_PRESENCE_GATING",
-           label: "Presence gating (suppress sends when present)", defaultValue: true),
+let toggleSettings: [ToggleSetting] = [
+    ToggleSetting(key: "camera", envVar: "TG_RELAY_PRESENCE_CAMERA",
+                  label: "Face detection (camera)", defaultValue: true),
+    ToggleSetting(key: "gating", envVar: "TG_RELAY_PRESENCE_GATING",
+                  label: "Presence gating (suppress sends when present)", defaultValue: true),
 ]
 
 // MARK: - State model
@@ -92,12 +103,123 @@ struct PresenceStatus {
     let overrideExpiresIn: Int?
 }
 
+// MARK: - Daemon Manager
+
+class DaemonManager {
+    private var process: Process?
+    private var restartCount = 0
+    private let maxRestartDelay: TimeInterval = 30
+
+    var isRunning: Bool { process?.isRunning ?? false }
+
+    func start() {
+        guard !isRunning else { return }
+
+        let env = buildEnv()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: bunBin)
+        proc.arguments = [daemonScript]
+        proc.environment = env
+
+        // Pipe stdout/stderr to the log file
+        let logHandle = FileHandle(forWritingAtPath: logFile)
+            ?? { FileManager.default.createFile(atPath: logFile, contents: nil)
+                 return FileHandle(forWritingAtPath: logFile) }()
+        logHandle?.seekToEndOfFile()
+        proc.standardOutput = logHandle
+        proc.standardError = logHandle
+
+        proc.terminationHandler = { [weak self] p in
+            guard let self = self else { return }
+            let code = p.terminationStatus
+            self.appendLog("[presence-monitor] daemon exited (code=\(code)), restarting...")
+            // Exponential backoff restart
+            let delay = min(Double(1 << self.restartCount), self.maxRestartDelay)
+            self.restartCount += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                self.process = nil
+                self.start()
+            }
+        }
+
+        do {
+            try proc.run()
+            process = proc
+            restartCount = 0
+            appendLog("[presence-monitor] daemon started (pid=\(proc.processIdentifier))")
+        } catch {
+            appendLog("[presence-monitor] failed to start daemon: \(error)")
+        }
+    }
+
+    func stop() {
+        guard let proc = process, proc.isRunning else { return }
+        proc.terminationHandler = nil  // Don't auto-restart
+        proc.terminate()
+        process = nil
+        appendLog("[presence-monitor] daemon stopped")
+    }
+
+    func restart() {
+        stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            self.start()
+        }
+    }
+
+    private func buildEnv() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let defaults = UserDefaults.standard
+
+        // Core settings (always on for the MacBook Pro producer)
+        env["TG_RELAY_PRESENCE_PRODUCER"] = "on"
+        env["TG_RELAY_TTS_TIMEOUT_MS"] = "300000"
+
+        // Token
+        let savedToken = defaults.string(forKey: "presenceToken") ?? ""
+        let envToken = ProcessInfo.processInfo.environment["PRESENCE_TOKEN"] ?? ""
+        let finalToken = !savedToken.isEmpty ? savedToken : (!envToken.isEmpty ? envToken : "test123")
+        env["TG_RELAY_PRESENCE_TOKEN"] = finalToken
+
+        // Toggles
+        for t in toggleSettings {
+            let on = defaults.object(forKey: t.key) as? Bool ?? t.defaultValue
+            env[t.envVar] = on ? "on" : "off"
+        }
+
+        // Sliders
+        for s in sliderSettings {
+            let stored = defaults.integer(forKey: s.key)
+            let value = stored > 0 ? clamp(stored, s.min, s.max) : s.defaultValue
+            switch s.unit {
+            case .seconds:
+                env[s.envVar] = String(value)
+            case .milliseconds:
+                env[s.envVar] = String(value * 1000)
+            case .minutes:
+                env[s.envVar] = String(value * 60 * 1000)
+            }
+        }
+
+        return env
+    }
+
+    private func appendLog(_ msg: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        if let h = FileHandle(forWritingAtPath: logFile) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            h.closeFile()
+        }
+    }
+}
+
 // MARK: - Settings Window
 
 class SettingsWindowController: NSObject {
     private var window: NSWindow?
-    private var sliders: [(Setting, NSSlider, NSTextField)] = []
-    private var toggleButtons: [(Toggle, NSButton)] = []
+    private var sliders: [(SliderSetting, NSSlider, NSTextField)] = []
+    private var toggleButtons: [(ToggleSetting, NSButton)] = []
     private weak var appDelegate: AppDelegate?
 
     init(appDelegate: AppDelegate) {
@@ -114,10 +236,10 @@ class SettingsWindowController: NSObject {
 
         let rowHeight: CGFloat = 70
         let toggleHeight: CGFloat = 30
-        let padding: CGFloat = 60  // top/bottom padding + button
+        let padding: CGFloat = 60
         let windowHeight = CGFloat(sliderSettings.count) * rowHeight
             + CGFloat(toggleSettings.count) * toggleHeight
-            + padding + 30  // section header
+            + padding + 30
 
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 420, height: windowHeight),
@@ -138,7 +260,7 @@ class SettingsWindowController: NSObject {
 
         var y = windowHeight - 30
 
-        // ── Toggles section ─────────────────────────────────
+        // Toggles
         let toggleHeader = NSTextField(labelWithString: "Features")
         toggleHeader.frame = NSRect(x: 20, y: y, width: 200, height: 18)
         toggleHeader.font = NSFont.systemFont(ofSize: 11, weight: .bold)
@@ -159,7 +281,7 @@ class SettingsWindowController: NSObject {
 
         y -= 20
 
-        // ── Sliders section ─────────────────────────────────
+        // Sliders
         let slidersHeader = NSTextField(labelWithString: "Thresholds")
         slidersHeader.frame = NSRect(x: 20, y: y, width: 200, height: 18)
         slidersHeader.font = NSFont.systemFont(ofSize: 11, weight: .bold)
@@ -172,9 +294,6 @@ class SettingsWindowController: NSObject {
             let stored = defaults.integer(forKey: s.key)
             let value = stored > 0 ? clamp(stored, s.min, s.max) : s.defaultValue
 
-            // Special case: override TTL is in minutes in the UI
-            let displayValue = s.key == "overrideTtlMinutes" ? value : value
-
             let titleLabel = NSTextField(labelWithString: s.label)
             titleLabel.frame = NSRect(x: 20, y: y + 35, width: 300, height: 18)
             titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
@@ -183,13 +302,13 @@ class SettingsWindowController: NSObject {
             let slider = NSSlider(frame: NSRect(x: 20, y: y + 8, width: 290, height: 20))
             slider.minValue = Double(s.min)
             slider.maxValue = Double(s.max)
-            slider.integerValue = displayValue
+            slider.integerValue = value
             slider.isContinuous = true
             slider.target = self
             slider.action = #selector(sliderChanged(_:))
             content.addSubview(slider)
 
-            let valLabel = NSTextField(labelWithString: formatForSetting(s, displayValue))
+            let valLabel = NSTextField(labelWithString: formatForSetting(s, value))
             valLabel.frame = NSRect(x: 318, y: y + 8, width: 80, height: 20)
             valLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             valLabel.alignment = .right
@@ -198,7 +317,6 @@ class SettingsWindowController: NSObject {
             sliders.append((s, slider, valLabel))
         }
 
-        // Apply button
         let applyBtn = NSButton(frame: NSRect(x: 150, y: 15, width: 130, height: 32))
         applyBtn.title = "Apply & Restart"
         applyBtn.bezelStyle = .rounded
@@ -222,68 +340,20 @@ class SettingsWindowController: NSObject {
     @objc private func applySettings() {
         let defaults = UserDefaults.standard
 
-        // Read the current plist
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
-              var plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              var env = plist["EnvironmentVariables"] as? [String: String] else {
-            showAlert("Could not read daemon plist at:\n\(daemonPlist)")
-            return
-        }
-
-        // Write slider values
         for (s, slider, _) in sliders {
-            let value = slider.integerValue
-            defaults.set(value, forKey: s.key)
-
-            switch s.unit {
-            case .seconds:
-                env[s.envVar] = String(value)
-            case .milliseconds:
-                if s.key == "overrideTtlMinutes" {
-                    env[s.envVar] = String(value * 60 * 1000) // minutes → ms
-                } else {
-                    env[s.envVar] = String(value * 1000)  // seconds → ms
-                }
-            }
+            defaults.set(slider.integerValue, forKey: s.key)
         }
-
-        // Write toggle values
         for (t, btn) in toggleButtons {
-            let on = btn.state == .on
-            defaults.set(on, forKey: t.key)
-            env[t.envVar] = on ? "on" : "off"
+            defaults.set(btn.state == .on, forKey: t.key)
         }
 
-        plist["EnvironmentVariables"] = env
-
-        // Write plist back
-        if let newData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-            do {
-                try newData.write(to: URL(fileURLWithPath: daemonPlist))
-            } catch {
-                showAlert("Could not write plist: \(error.localizedDescription)")
-                return
-            }
-        }
-
-        // Restart daemon (unload + load to pick up plist changes)
-        appDelegate?.restartDaemonAction()
+        appDelegate?.restartDaemon()
         window?.close()
     }
 
-    private func formatForSetting(_ s: Setting, _ value: Int) -> String {
-        if s.key == "overrideTtlMinutes" {
-            return "\(value) min"
-        }
+    private func formatForSetting(_ s: SliderSetting, _ value: Int) -> String {
+        if s.unit == .minutes { return "\(value) min" }
         return formatDuration(value)
-    }
-
-    private func showAlert(_ message: String) {
-        let alert = NSAlert()
-        alert.messageText = "Settings Error"
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.runModal()
     }
 }
 
@@ -304,24 +374,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var lastStatus: PresenceStatus?
-    private var daemonRunning: Bool = false
+    private let daemon = DaemonManager()
     private var settingsController: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.font = NSFont.systemFont(ofSize: 14)
         updateUI(status: nil)
-        poll()
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.poll()
+
+        // Unload the standalone daemon plist if it exists (migration)
+        unloadLegacyDaemon()
+
+        // Start the daemon as a child process
+        daemon.start()
+
+        // Start polling after a brief delay to let daemon start
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            self.poll()
+            self.timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+                self?.poll()
+            }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        daemon.stop()
+    }
+
+    private func unloadLegacyDaemon() {
+        let plist = "\(NSHomeDirectory())/Library/LaunchAgents/\(daemonLabel).plist"
+        guard FileManager.default.fileExists(atPath: plist) else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = ["unload", plist]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
     }
 
     // MARK: - Polling
 
     private func poll() {
-        daemonRunning = isDaemonRunning()
-
         guard let url = URL(string: "\(baseURL)/presence") else {
             DispatchQueue.main.async { self.updateUI(status: nil) }
             return
@@ -359,12 +453,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let s = status else {
             statusItem.button?.title = "❓"
             addDisabled(menu, "Presence: Unreachable")
-            if !daemonRunning {
+            if !daemon.isRunning {
                 addDisabled(menu, "⛔ Daemon is not running")
             } else {
-                addDisabled(menu, "Daemon running but endpoint not reachable")
+                addDisabled(menu, "Daemon starting up…")
             }
-            addDisabled(menu, "\(baseURL)/presence")
             menu.addItem(NSMenuItem.separator())
             addDaemonControls(menu)
             menu.addItem(NSMenuItem.separator())
@@ -373,7 +466,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Menubar icon
         if s.stale {
             statusItem.button?.title = "⚠️"
         } else if s.present {
@@ -382,7 +474,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = "🔴"
         }
 
-        // Status details
         let stateLabel = s.stale ? "Stale" : (s.present ? "Present (here)" : "Away")
         addDisabled(menu, "Status: \(stateLabel)")
         addDisabled(menu, "Updated: \(formatAge(s.ageSeconds))")
@@ -398,7 +489,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             addDisabled(menu, "Producer: off (consumer-only)")
         }
 
-        // Override info
         if let op = s.overridePresent, let exp = s.overrideExpiresIn {
             let label = op ? "HERE" : "AWAY"
             addDisabled(menu, "Override: \(label) (expires in \(formatAge(exp)))")
@@ -406,7 +496,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Override actions
         let hereItem = NSMenuItem(title: "☀️  Set Here (30 min)", action: #selector(setHere), keyEquivalent: "h")
         hereItem.target = self
         menu.addItem(hereItem)
@@ -429,23 +518,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    // MARK: - Daemon controls
-
     private func addDaemonControls(_ menu: NSMenu) {
-        if daemonRunning {
+        if daemon.isRunning {
             addDisabled(menu, "✅ Daemon running")
-            let restartItem = NSMenuItem(title: "🔄  Restart Daemon", action: #selector(restartDaemon), keyEquivalent: "r")
-            restartItem.target = self
-            menu.addItem(restartItem)
-            let stopItem = NSMenuItem(title: "⏹  Stop Daemon", action: #selector(stopDaemon), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
         } else {
             addDisabled(menu, "⛔ Daemon stopped")
-            let startItem = NSMenuItem(title: "▶️  Start Daemon", action: #selector(startDaemon), keyEquivalent: "r")
-            startItem.target = self
-            menu.addItem(startItem)
         }
+        let restartItem = NSMenuItem(title: "🔄  Restart Daemon", action: #selector(restartDaemonAction), keyEquivalent: "r")
+        restartItem.target = self
+        menu.addItem(restartItem)
     }
 
     private func addSettingsAndQuit(_ menu: NSMenu) {
@@ -471,56 +552,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsController?.show()
     }
 
-    @objc private func startDaemon() {
-        runLaunchctl(["load", daemonPlist])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
-    }
+    @objc private func restartDaemonAction() { restartDaemon() }
 
-    @objc private func stopDaemon() {
-        runLaunchctl(["unload", daemonPlist])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.poll() }
-    }
-
-    @objc private func restartDaemon() { restartDaemonAction() }
-
-    func restartDaemonAction() {
-        // Unload + load picks up plist changes (kickstart doesn't)
-        runLaunchctl(["unload", daemonPlist])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            self.runLaunchctl(["load", daemonPlist])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.poll() }
-        }
+    func restartDaemon() {
+        daemon.restart()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.poll() }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
-
-    // MARK: - Daemon helpers
-
-    private func isDaemonRunning() -> Bool {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        let uid = getuid()
-        task.arguments = ["print", "gui/\(uid)/\(daemonLabel)"]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-            task.waitUntilExit()
-            return task.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
-    private func runLaunchctl(_ args: [String]) {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        task.arguments = args
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
-    }
 
     // MARK: - API calls
 
@@ -529,8 +568,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let t = ProcessInfo.processInfo.environment["PRESENCE_TOKEN"]
+            ?? UserDefaults.standard.string(forKey: "presenceToken") ?? ""
+        if !t.isEmpty {
+            request.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["present": present])
         URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
@@ -542,8 +583,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = URL(string: "\(baseURL)/presence/override") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
-        if !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let t = ProcessInfo.processInfo.environment["PRESENCE_TOKEN"]
+            ?? UserDefaults.standard.string(forKey: "presenceToken") ?? ""
+        if !t.isEmpty {
+            request.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
         }
         URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.poll() }
@@ -568,7 +611,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Entry point
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // No dock icon
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
