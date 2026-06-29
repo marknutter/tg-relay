@@ -74,9 +74,9 @@ export const PRESENCE_CAMERA = (process.env.TG_RELAY_PRESENCE_CAMERA ?? 'off').t
 /** Minimum interval between camera samples (ms). Keeps power use low. */
 export const FACE_SAMPLE_MS = parseInt(process.env.TG_RELAY_FACE_SAMPLE_MS ?? '15000', 10)
 
-/** Path to the FaceDetect Swift binary. */
+/** Path to the FaceDetect binary. Uses the .app bundle for TCC camera permissions. */
 export const FACE_DETECT_BIN = process.env.TG_RELAY_FACE_DETECT_BIN ??
-  path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'tools', 'presence-camera', 'FaceDetect')
+  path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'tools', 'presence-camera', 'FaceDetect.app', 'Contents', 'MacOS', 'FaceDetect')
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
