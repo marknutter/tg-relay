@@ -50,6 +50,17 @@ import {
   loadAntigravityState, saveAntigravityState,
   normalizeOutboundMode, defaultReplyChatId,
 } from './antigravity.js'
+import {
+  computePresence, readAllSignals, readFaceDetected, presenceShouldSend,
+  fetchRemotePresence, buildPresenceResponse, validatePostPresence,
+  initialPresenceState,
+  PRESENCE_TICK_MS, PRESENT_IDLE_SECONDS, AWAY_IDLE_SECONDS,
+  PRESENCE_STALE_SECONDS, PRESENCE_GATING, PRESENCE_PORT,
+  PRESENCE_TOKEN, PRESENCE_PRODUCER, PRESENCE_LAPTOP_URL,
+  PRESENCE_CACHE_MS, OVERRIDE_TTL_MS,
+  PRESENCE_CAMERA, FACE_SAMPLE_MS,
+  type PresenceState, type PresenceOverride,
+} from './presence.js'
 import type {
   DaemonToPlugin, InboundMessage,
   PluginToDaemon, Hello, Ack, OutboundDownloadResult,
@@ -424,6 +435,31 @@ type AntigravityRuntime = {
 
 const channels = new Map<string, ChannelState>()
 
+// ── Global presence runtime (#86) ───────────────────────────────────────────
+//
+// Presence is GLOBAL (one property of Mark, not per-channel). The producer
+// runs once per daemon; the consumer is consulted on every channel's outbound
+// send. Unlike halt-watch (per-channel), this lives outside ChannelState.
+
+/** Live state for the global presence producer + consumer cache. */
+type PresenceRuntime = {
+  state: PresenceState
+  override: PresenceOverride
+  /** Reentrancy guard so a slow signal read can't overlap the next tick. */
+  ticking: boolean
+  timer: ReturnType<typeof setInterval>
+  /** Bun HTTP server for GET/POST /presence. */
+  httpServer?: ReturnType<typeof Bun.serve>
+  /** Consumer cache: avoid re-fetching presence on every send in a burst. */
+  cachedShouldSend: { value: boolean; ts: number } | null
+  /** Timestamp of the last camera face sample (ms). Throttles sampling to FACE_SAMPLE_MS. */
+  lastFaceSampleTs: number
+  /** Cached result of the last face detection. Reused between samples to avoid flicker. */
+  lastFaceResult: boolean | null
+}
+
+let presenceRuntime: PresenceRuntime | null = null
+
 // ── Socket helpers ──────────────────────────────────────────────────────────
 
 function liveSockets(state: ChannelState): net.Socket[] {
@@ -546,6 +582,18 @@ async function handlePluginMessage(
         if (!chatId) throw new Error('reply has no chat_id and channel has no allowFrom default')
         assertAllowedChat(state.config.stateDir, chatId)
         const reply_to = msg.reply_to != null ? Number(msg.reply_to) : undefined
+
+        // Presence gate (#86): suppress proactive sends when Mark is present.
+        // Do NOT gate direct replies to inbound Telegram messages (reply_to set
+        // means the session is responding to a specific message — the user is on
+        // their phone, always send).
+        if (reply_to == null) {
+          const send = await shouldSendPresenceGated()
+          if (!send) {
+            log(state.config.name, `presence: suppressed reply to chat ${chatId} (${msg.text.length} chars)`)
+            break
+          }
+        }
 
         const files = msg.files ?? []
         for (const f of files) {
@@ -788,6 +836,52 @@ function setupInboundHandlers(state: ChannelState): void {
     }
 
     await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+  })
+
+  // Presence override commands (#86): /here and /away let Mark manually
+  // force presence state from Telegram. The override expires after
+  // OVERRIDE_TTL_MS, then auto-detection resumes.
+
+  bot.command('here', async ctx => {
+    if (ctx.chat?.type !== 'private') return
+    const from = ctx.from
+    if (!from) return
+    const senderId = String(from.id)
+    const access = readAccessFile(stateDir)
+    if (!access.allowFrom.includes(senderId)) return  // silent drop for unpaired users
+
+    const rt = presenceRuntime
+    if (!rt) {
+      await ctx.reply('Presence runtime not active.')
+      return
+    }
+    const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+    rt.override = { present: true, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+    // Clear consumer cache so the override takes effect immediately.
+    rt.cachedShouldSend = null
+    log(config.name, `presence: /here override set by ${senderId} (expires in ${ttlMin}min)`)
+    await ctx.reply(`✅ Presence set to HERE — proactive sends will be suppressed for ${ttlMin} min.`)
+  })
+
+  bot.command('away', async ctx => {
+    if (ctx.chat?.type !== 'private') return
+    const from = ctx.from
+    if (!from) return
+    const senderId = String(from.id)
+    const access = readAccessFile(stateDir)
+    if (!access.allowFrom.includes(senderId)) return  // silent drop for unpaired users
+
+    const rt = presenceRuntime
+    if (!rt) {
+      await ctx.reply('Presence runtime not active.')
+      return
+    }
+    const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+    rt.override = { present: false, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+    // Clear consumer cache so the override takes effect immediately.
+    rt.cachedShouldSend = null
+    log(config.name, `presence: /away override set by ${senderId} (expires in ${ttlMin}min)`)
+    await ctx.reply(`✅ Presence set to AWAY — proactive sends will come through for ${ttlMin} min.`)
   })
 
   // Inbound message handlers
@@ -1278,6 +1372,13 @@ function emoji(e: string): ReactionTypeEmoji['emoji'] {
 
 /** Relay completed agy turns to the channel's primary DM, chunked like replies. */
 async function relayAgyTurns(state: ChannelState, turns: { stepIndex: number; content: string }[]): Promise<void> {
+  // Presence gate (#86): agy relay is a proactive send — suppress when present.
+  const send = await shouldSendPresenceGated()
+  if (!send) {
+    log(state.config.name, `agy: ${turns.length} turn(s) suppressed by presence`)
+    return
+  }
+
   const access = readAccessFile(state.config.stateDir)
   const chatId = access.allowFrom[0]
   if (!chatId) {
@@ -1470,6 +1571,13 @@ async function haltWatchTick(state: ChannelState): Promise<void> {
     rt.state = next
     if (!shouldAlert) return
 
+    // Presence gate (#86): suppress halt-watch alerts when Mark is present.
+    const send = await shouldSendPresenceGated()
+    if (!send) {
+      log(state.config.name, `halt-watch: alert suppressed by presence (session halted but user is present)`)
+      return
+    }
+
     const chatId = access.allowFrom[0]
     if (!chatId) {
       log(state.config.name, `halt-watch: session halted but access.allowFrom is empty — no one to alert`)
@@ -1510,6 +1618,253 @@ function reconcileHaltWatch(state: ChannelState): void {
   const enabled = haltWatchEnabled(access.remoteControl)
   if (enabled && !state.haltWatch) startHaltWatch(state)
   else if (!enabled && state.haltWatch) stopHaltWatch(state)
+}
+
+// ── Presence producer + consumer (#86) ──────────────────────────────────────
+//
+// Global presence detection. The producer is a tick-loop (laptop only) that
+// polls macOS signals and updates in-memory state. The consumer is a gate
+// consulted before every proactive Telegram send. Both are gated by
+// PRESENCE_GATING — when "off" (default), presence is never queried and the
+// daemon behaves identically to pre-#86.
+
+/**
+ * Consumer gate: should this proactive send go through?
+ *
+ * When PRESENCE_GATING !== 'on', always returns true (send) — current
+ * behavior unchanged. When gating is on, checks presence and caches the
+ * result for PRESENCE_CACHE_MS so a burst of sends triggers at most one
+ * fetch per cache window.
+ */
+async function shouldSendPresenceGated(): Promise<boolean> {
+  if (PRESENCE_GATING !== 'on') return true  // kill-switch: behave like before
+
+  const rt = presenceRuntime
+  if (!rt) return true  // runtime not initialized → fail-safe → send
+
+  const now = Date.now()
+
+  // Return cached result if still fresh.
+  if (rt.cachedShouldSend && (now - rt.cachedShouldSend.ts) < PRESENCE_CACHE_MS) {
+    return rt.cachedShouldSend.value
+  }
+
+  let state: PresenceState | null = null
+
+  if (PRESENCE_PRODUCER) {
+    // Laptop: read local in-memory state directly.
+    state = rt.state
+  } else if (PRESENCE_LAPTOP_URL) {
+    // Mac mini: fetch from the laptop's tailnet endpoint.
+    state = await fetchRemotePresence(PRESENCE_LAPTOP_URL)
+  }
+  // else: no producer, no laptop URL → state stays null → send (fail-safe)
+
+  const result = presenceShouldSend(state, PRESENCE_STALE_SECONDS, now)
+  rt.cachedShouldSend = { value: result, ts: now }
+  return result
+}
+
+/** One producer tick: read macOS signals, compute presence, update state. */
+async function presenceTick(): Promise<void> {
+  const rt = presenceRuntime
+  if (!rt || rt.ticking) return
+  rt.ticking = true
+  try {
+    const signals = readAllSignals()
+
+    // Camera face detection (#87): only sample when it would add value.
+    // Skip when: camera disabled, locked, asleep, clamshell shut, on a
+    // video call (camera busy), HID idle below present threshold (already
+    // definitely present), or too soon since last sample.
+    if (
+      PRESENCE_CAMERA &&
+      signals.screenLocked !== true &&
+      signals.displayAsleep !== true &&
+      signals.clamshellClosed !== true &&
+      signals.videoCallActive !== true &&
+      (signals.hidIdleSeconds ?? Infinity) >= PRESENT_IDLE_SECONDS &&
+      (Date.now() - rt.lastFaceSampleTs) >= FACE_SAMPLE_MS
+    ) {
+      signals.faceDetected = await readFaceDetected()
+      rt.lastFaceResult = signals.faceDetected
+      rt.lastFaceSampleTs = Date.now()
+      if (signals.faceDetected !== null) {
+        logGlobal(`presence: face sample → ${signals.faceDetected ? 'detected' : 'no face'}`)
+      }
+    } else if (PRESENCE_CAMERA && rt.lastFaceResult !== null) {
+      // Between samples: carry forward the last result so presence doesn't
+      // flicker (green on sample tick, red on non-sample ticks). Expire the
+      // cache at 2× the sample interval as a safety net.
+      const faceAge = Date.now() - rt.lastFaceSampleTs
+      if (faceAge < FACE_SAMPLE_MS * 2) {
+        signals.faceDetected = rt.lastFaceResult
+      } else {
+        rt.lastFaceResult = null  // stale → clear
+      }
+    }
+
+    const { present } = computePresence(
+      signals,
+      rt.state,
+      rt.override,
+      { presentIdleSeconds: PRESENT_IDLE_SECONDS, awayIdleSeconds: AWAY_IDLE_SECONDS },
+    )
+    rt.state = { present, ts: Date.now(), source: 'producer' }
+  } catch (err) {
+    logGlobal(`presence: tick error: ${err}`)
+  } finally {
+    rt.ticking = false
+  }
+}
+
+/** Start the global presence runtime (producer + HTTP endpoint). */
+function startPresence(): void {
+  if (presenceRuntime) return
+
+  const rt: PresenceRuntime = {
+    state: initialPresenceState(),
+    override: null,
+    ticking: false,
+    timer: setInterval(() => { void presenceTick() }, PRESENCE_TICK_MS),
+    cachedShouldSend: null,
+    lastFaceSampleTs: 0,
+    lastFaceResult: null,
+  }
+  presenceRuntime = rt
+
+  // Run the first tick immediately so state is populated before the first send.
+  if (PRESENCE_PRODUCER) {
+    void presenceTick()
+  }
+
+  // HTTP endpoint for GET/POST /presence.
+  // Bind to 0.0.0.0 for now — tailnet ACLs gate access. The port is
+  // configurable via PRESENCE_PORT.
+  try {
+    rt.httpServer = Bun.serve({
+      port: PRESENCE_PORT,
+      hostname: '0.0.0.0',
+      fetch: async (req) => {
+        const url = new URL(req.url)
+
+        // ── GET/POST /presence ──────────────────────────────────────────
+        if (url.pathname === '/presence') {
+          if (req.method === 'GET') {
+            const body = buildPresenceResponse(rt.state, PRESENCE_STALE_SECONDS)
+            const now = Date.now()
+            return Response.json({
+              ...body,
+              gating: PRESENCE_GATING,
+              producer: PRESENCE_PRODUCER,
+              override: rt.override && rt.override.expiresAt > now
+                ? { present: rt.override.present, expiresInSeconds: Math.round((rt.override.expiresAt - now) / 1000) }
+                : null,
+            })
+          }
+
+          if (req.method === 'POST') {
+            // Bearer token required for POST.
+            if (!PRESENCE_TOKEN) {
+              return new Response('POST /presence is disabled (no PRESENCE_TOKEN configured)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            let body: unknown
+            try {
+              body = await req.json()
+            } catch {
+              return Response.json({ error: 'invalid JSON' }, { status: 400 })
+            }
+            const validated = validatePostPresence(body)
+            if (!validated.ok) {
+              return Response.json({ error: validated.error }, { status: 400 })
+            }
+            rt.state = { present: validated.present, ts: Date.now(), source: validated.source }
+            // Clear the consumer cache so the new state takes effect immediately.
+            rt.cachedShouldSend = null
+            logGlobal(`presence: POST update present=${validated.present} source=${validated.source}`)
+            return Response.json({ ok: true })
+          }
+
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+
+        // ── POST/DELETE /presence/override ───────────────────────────────
+        // For the menubar app and API consumers to set /here /away style
+        // overrides without going through Telegram.
+        if (url.pathname === '/presence/override') {
+          if (req.method === 'POST') {
+            if (!PRESENCE_TOKEN) {
+              return new Response('POST /presence/override is disabled (no PRESENCE_TOKEN)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            let body: unknown
+            try {
+              body = await req.json()
+            } catch {
+              return Response.json({ error: 'invalid JSON' }, { status: 400 })
+            }
+            const obj = body as Record<string, unknown>
+            if (typeof obj.present !== 'boolean') {
+              return Response.json({ error: '"present" must be a boolean' }, { status: 400 })
+            }
+            rt.override = { present: obj.present, expiresAt: Date.now() + OVERRIDE_TTL_MS }
+            rt.cachedShouldSend = null
+            const ttlMin = Math.round(OVERRIDE_TTL_MS / 60000)
+            const expiresInSeconds = Math.round(OVERRIDE_TTL_MS / 1000)
+            logGlobal(`presence: override set via API present=${obj.present} (expires in ${ttlMin}min)`)
+            return Response.json({ ok: true, present: obj.present, expiresInSeconds })
+          }
+
+          if (req.method === 'DELETE') {
+            if (!PRESENCE_TOKEN) {
+              return new Response('DELETE /presence/override is disabled (no PRESENCE_TOKEN)', { status: 403 })
+            }
+            const auth = req.headers.get('authorization') ?? ''
+            if (auth !== `Bearer ${PRESENCE_TOKEN}`) {
+              return new Response('Unauthorized', { status: 401 })
+            }
+            rt.override = null
+            rt.cachedShouldSend = null
+            logGlobal('presence: override cleared via API')
+            return Response.json({ ok: true })
+          }
+
+          return new Response('Method Not Allowed', { status: 405 })
+        }
+
+        return new Response('Not Found', { status: 404 })
+      },
+    })
+    logGlobal(`presence: HTTP endpoint listening on :${PRESENCE_PORT}`)
+  } catch (err) {
+    logGlobal(`presence: failed to start HTTP endpoint: ${err}`)
+  }
+
+  logGlobal(
+    `presence: started (gating=${PRESENCE_GATING}, producer=${PRESENCE_PRODUCER}, ` +
+    `camera=${PRESENCE_CAMERA}, tick=${PRESENCE_TICK_MS}ms, face_sample=${FACE_SAMPLE_MS}ms, ` +
+    `present<${PRESENT_IDLE_SECONDS}s, away>${AWAY_IDLE_SECONDS}s, ` +
+    `stale>${PRESENCE_STALE_SECONDS}s)`,
+  )
+}
+
+/** Stop the global presence runtime. */
+function stopPresence(): void {
+  const rt = presenceRuntime
+  if (!rt) return
+  clearInterval(rt.timer)
+  if (rt.httpServer) {
+    rt.httpServer.stop()
+  }
+  presenceRuntime = null
+  logGlobal('presence: stopped')
 }
 
 // ── Stop a single channel ───────────────────────────────────────────────────
@@ -1874,6 +2229,10 @@ async function shutdown(): Promise<void> {
   const startedAt = Date.now()
   logGlobal(`shutting down (channels=${channels.size})...`)
 
+  // Stop presence before channels so the HTTP server isn't serving stale
+  // state while channels are draining.
+  stopPresence()
+
   const stopPromises = Array.from(channels.keys()).map(name => stopChannel(name))
   const allStopped = Promise.allSettled(stopPromises)
   const timeout = new Promise<'timeout'>(resolve =>
@@ -1904,6 +2263,10 @@ process.on('uncaughtException', err => {
 logGlobal(`starting (pid=${process.pid})`)
 
 ensurePluginHijack()
+
+// Start global presence runtime before channels so the consumer gate is
+// ready when the first outbound send happens.
+startPresence()
 
 const initialChannels = discoverChannels()
 logGlobal(`discovered ${initialChannels.length} channel(s): ${initialChannels.map(c => c.name).join(', ')}`)

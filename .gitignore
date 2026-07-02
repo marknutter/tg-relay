@@ -9,3 +9,8 @@ tts/__pycache__/
 # Per-machine dev MCP config — the plugin runs via the hijacked built-in
 # plugin (see install.sh / install.ps1), not a committed project .mcp.json.
 .mcp.json
+tools/presence-menubar/PresenceMenuBar
+tools/presence-camera/PresenceDetect
+tools/presence-camera/PresenceDetect.app/
+tools/presence-menubar/PresenceMonitor.app/
+tools/presence-menubar/PresenceMonitor
