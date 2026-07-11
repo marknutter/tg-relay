@@ -26,6 +26,7 @@ import {
   initialPresenceState,
   buildPresenceResponse,
   validatePostPresence,
+  consumerNextState,
   type PresenceSignals,
   type PresenceState,
   type PresenceOverride,
@@ -581,5 +582,101 @@ describe('validatePostPresence', () => {
   test('non-object body (number) → error', () => {
     const result = validatePostPresence(42)
     expect(result.ok).toBe(false)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+//  consumerNextState — consumer mirrors remote producer
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('consumerNextState', () => {
+  // ─── successful fetch: mirror the remote producer ──────────────────────
+
+  describe('successful fetch (remote non-null)', () => {
+    test('remote present=true, ts=1000, source="producer" → mirrors present, ts, source="remote"', () => {
+      const remote: PresenceState = { present: true, ts: 1000, source: 'producer' }
+      const prev: PresenceState = { present: false, ts: 0, source: 'init' }
+      expect(consumerNextState(remote, prev)).toEqual({
+        present: true,
+        ts: 1000,
+        source: 'remote',
+      })
+    })
+
+    test('remote present=false → mirrors present=false, ts preserved, source="remote"', () => {
+      const remote: PresenceState = { present: false, ts: 555, source: 'producer' }
+      const prev: PresenceState = { present: true, ts: 999, source: 'remote' }
+      expect(consumerNextState(remote, prev)).toEqual({
+        present: false,
+        ts: 555,
+        source: 'remote',
+      })
+    })
+
+    test('ts is preserved exactly from remote (NOT replaced with a "now"-ish value)', () => {
+      // Deliberately old timestamp — if the impl stamped Date.now() this would
+      // be a huge millisecond value, not 12345. Downstream staleness detection
+      // relies on the producer's original ts surviving.
+      const remote: PresenceState = { present: true, ts: 12345, source: 'producer' }
+      const prev: PresenceState = { present: false, ts: 0, source: 'init' }
+      const result = consumerNextState(remote, prev)
+      expect(result.ts).toBe(12345)
+    })
+
+    test('source is always overridden to "remote" (remote.source="override")', () => {
+      const remote: PresenceState = { present: true, ts: 2000, source: 'override' }
+      const prev: PresenceState = { present: false, ts: 0, source: 'init' }
+      expect(consumerNextState(remote, prev).source).toBe('remote')
+    })
+
+    test('source is always overridden to "remote" (remote.source="post")', () => {
+      const remote: PresenceState = { present: false, ts: 3000, source: 'post' }
+      const prev: PresenceState = { present: true, ts: 100, source: 'remote' }
+      expect(consumerNextState(remote, prev).source).toBe('remote')
+    })
+  })
+
+  // ─── failed fetch: retain prev so it can age into staleness ────────────
+
+  describe('failed fetch (remote null)', () => {
+    test('remote=null → returns prev unchanged (present and ts match prev exactly)', () => {
+      const prev: PresenceState = { present: true, ts: 777, source: 'remote' }
+      const result = consumerNextState(null, prev)
+      expect(result.present).toBe(prev.present)
+      expect(result.ts).toBe(prev.ts)
+    })
+
+    test('remote=null → never fabricates a fresh timestamp (old ts survives)', () => {
+      const prev: PresenceState = { present: false, ts: 12345, source: 'remote' }
+      const result = consumerNextState(null, prev)
+      expect(result.ts).toBe(12345)
+    })
+
+    test('remote=null → full prev state is preserved', () => {
+      const prev: PresenceState = { present: true, ts: 424242, source: 'remote' }
+      expect(consumerNextState(null, prev)).toEqual(prev)
+    })
+  })
+
+  // ─── purity ────────────────────────────────────────────────────────────
+
+  describe('purity (no mutation on success path)', () => {
+    test('does not mutate prev when mirroring a remote', () => {
+      const remote: PresenceState = { present: true, ts: 1000, source: 'producer' }
+      const prev: PresenceState = { present: false, ts: 0, source: 'init' }
+      consumerNextState(remote, prev)
+      // prev must be untouched — the returned state is derived from remote.
+      expect(prev).toEqual({ present: false, ts: 0, source: 'init' })
+    })
+
+    test('does not mutate a frozen prev on the success path', () => {
+      const remote: PresenceState = { present: false, ts: 8888, source: 'producer' }
+      const prev = Object.freeze({ present: true, ts: 42, source: 'remote' }) as PresenceState
+      // Would throw in strict mode if the impl wrote to the frozen prev.
+      const result = consumerNextState(remote, prev)
+      expect(result).toEqual({ present: false, ts: 8888, source: 'remote' })
+      expect(prev.present).toBe(true)
+      expect(prev.ts).toBe(42)
+    })
   })
 })

@@ -52,7 +52,7 @@ import {
 } from './antigravity.js'
 import {
   computePresence, readAllSignals, readFaceDetected, presenceShouldSend,
-  fetchRemotePresence, buildPresenceResponse, validatePostPresence,
+  fetchRemotePresence, consumerNextState, buildPresenceResponse, validatePostPresence,
   initialPresenceState,
   PRESENCE_TICK_MS, PRESENT_IDLE_SECONDS, AWAY_IDLE_SECONDS,
   PRESENCE_STALE_SECONDS, PRESENCE_GATING, PRESENCE_PORT,
@@ -1665,12 +1665,28 @@ async function shouldSendPresenceGated(): Promise<boolean> {
   return result
 }
 
-/** One producer tick: read macOS signals, compute presence, update state. */
+/**
+ * One presence tick.
+ *
+ * Producer (laptop): read local macOS signals and compute presence.
+ * Consumer (e.g. Mac mini): this box has no meaningful local presence — Mark
+ * drives it over SSH, so its own HID idle is irrelevant. Mirror the laptop
+ * instead, using the SAME remote fetch the Telegram send-gate relies on, so the
+ * local GET /presence (read by the AskUserQuestion hook) reports the laptop's
+ * presence rather than this box's idle time.
+ */
 async function presenceTick(): Promise<void> {
   const rt = presenceRuntime
   if (!rt || rt.ticking) return
   rt.ticking = true
   try {
+    // Consumer path: mirror the producer. Fail-safe on a failed fetch — keep
+    // the prior state so it ages into staleness rather than fabricating one.
+    if (!PRESENCE_PRODUCER && PRESENCE_LAPTOP_URL) {
+      rt.state = consumerNextState(await fetchRemotePresence(PRESENCE_LAPTOP_URL), rt.state)
+      return
+    }
+
     const signals = readAllSignals()
 
     // Camera face detection (#87): only sample when it would add value.
@@ -1733,8 +1749,10 @@ function startPresence(): void {
   }
   presenceRuntime = rt
 
-  // Run the first tick immediately so state is populated before the first send.
-  if (PRESENCE_PRODUCER) {
+  // Run the first tick immediately so state is populated before the first read.
+  // Producers compute locally; consumers fetch the laptop — both need a warm
+  // rt.state before the first send-gate check or GET /presence.
+  if (PRESENCE_PRODUCER || PRESENCE_LAPTOP_URL) {
     void presenceTick()
   }
 

@@ -161,15 +161,19 @@ claude-channel-add mybot <BOT_TOKEN>
 
 The daemon picks up new channels automatically — no restart needed.
 
-### Why the multiple-choice picker is disabled
+### Why the multiple-choice picker is presence-gated
 
 Claude Code's `AskUserQuestion` tool renders an interactive arrow-key picker that reads input **only from the local terminal**. It is not an MCP call, so tg-relay never sees it and cannot forward it to Telegram — and there is no API, hook, or MCP path to feed an answer *back into* the blocked picker from outside the TTY. If Claude popped that picker in a phone-driven session, the session would hang with no way to answer.
 
-A question with N options is semantically identical to "ask in plain text, reply with a number," which routes through the normal Telegram message channel that already works. So `install.sh` ships a `PreToolUse` hook (`block-askuserquestion.sh`, installed into `~/.claude/hooks/` and registered in `~/.claude/settings.json`) that **denies `AskUserQuestion` outright** and hands Claude a reason instructing it to ask the question as a numbered list in its normal response instead.
+A question with N options is semantically identical to "ask in plain text, reply with a number," which routes through the normal Telegram message channel that already works. So `install.sh` ships a `PreToolUse` hook (`block-askuserquestion.sh`, installed into `~/.claude/hooks/` and registered in `~/.claude/settings.json`) that gates `AskUserQuestion` on **presence** (#86): at the moment Claude tries to ask, the hook does a sub-second `curl` of the daemon's `GET /presence` endpoint —
+
+- **Present + fresh** → the tool is allowed and the native picker renders (you're at the keyboard to answer it).
+- **Anything else** — away, stale data, endpoint unreachable, timeout, malformed response — → the tool is **denied** with a reason instructing Claude to ask the question as a numbered list in its normal response instead, which relays over Telegram and can never hang.
 
 Notes:
-- This applies to **all** Claude Code sessions on the machine, not just channel-bound ones — you lose the keyboard picker locally too. Numbered prose is equivalent and works everywhere; gating on "am I remote right now?" isn't reliable, so we suppress globally.
-- Denying outright also sidesteps a known bug where enabling any `PreToolUse` hook strips the picker's answer ([anthropics/claude-code#12031](https://github.com/anthropics/claude-code/issues/12031)) — no result is ever produced.
+- Every uncertain path fails safe to plain text — the hook only unlocks the picker on confident, fresh presence. On a machine whose keyboard you aren't physically at (e.g. the Mac mini driven remotely), local presence reads away and sessions stay plain-text automatically; set `TG_RELAY_PRESENCE_URL` to another machine's tailnet `/presence` endpoint to change which machine's presence governs.
+- `TG_RELAY_ASKUSER_PRESENCE=off` is a kill-switch restoring the old unconditional deny (the pre-presence behavior, which this hook shipped with for its first year).
+- The historical reason for denying unconditionally — a bug where any `PreToolUse` hook stripped the picker's answer ([anthropics/claude-code#12031](https://github.com/anthropics/claude-code/issues/12031)) — was fixed upstream (closed 2026-01-12); the allow path depends on that fix.
 - The installer merges its matcher into the existing `PreToolUse` array idempotently; re-running `install.sh` won't duplicate it or disturb other hooks.
 
 > Note: this is a workaround. The clean fix would be for Claude Code to route `AskUserQuestion` through the same `claude/channel` mechanism it already uses for permission prompts (which tg-relay relays as tappable Allow/Deny buttons). That needs an upstream `claude/channel/question` capability.

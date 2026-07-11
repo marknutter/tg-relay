@@ -401,6 +401,30 @@ export async function fetchRemotePresence(
   }
 }
 
+/**
+ * Decide a consumer machine's next presence state from a remote fetch.
+ *
+ * A consumer (e.g. the Mac mini) has no meaningful local presence — Mark drives
+ * it over SSH, so its own HID idle is irrelevant. Instead it mirrors the
+ * producer (laptop) it points at, so that its local GET /presence — which the
+ * AskUserQuestion picker hook reads — reflects the same presence the Telegram
+ * send-gate already consults via `fetchRemotePresence`.
+ *
+ * - Successful fetch → mirror the producer's state, tagged `source: 'remote'`.
+ *   The producer's `ts` is preserved (NOT refreshed to "now") so downstream
+ *   staleness (`buildPresenceResponse` / `presenceShouldSend`) still detects a
+ *   producer that has gone quiet.
+ * - Failed fetch (null) → retain the previous state. It ages into staleness
+ *   and the fail-safe kicks in (send / deny-picker) — never fabricate freshness.
+ */
+export function consumerNextState(
+  remote: PresenceState | null,
+  prev: PresenceState,
+): PresenceState {
+  if (!remote) return prev
+  return { present: remote.present, ts: remote.ts, source: 'remote' }
+}
+
 // ── Endpoint response builders ───────────────────────────────────────────────
 
 /** Build the JSON body for GET /presence. */
