@@ -39,13 +39,13 @@
  *     recency (mtime) plus a post-inject cooldown instead.
  */
 
-import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, statSync, readdirSync, mkdirSync, renameSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   resolveZellij,
-  parseListPanes,
+  listPanes,
+  runZellij,
   matchesBinary,
   type PaneInfo,
 } from './remote-control.js'
@@ -272,12 +272,6 @@ export function isBusyByMtime(mtimeMs: number | null, nowMs: number, busyWindowM
 
 export type InjectResult = { ok: true } | { ok: false; error: string }
 
-function zellijError(err: unknown, what: string): string {
-  const e = err as Error & { stderr?: Buffer }
-  const stderr = e.stderr ? e.stderr.toString().trim() : ''
-  return stderr || e.message || `zellij ${what} failed`
-}
-
 /**
  * Strip control characters except newline and tab. Prevents a Telegram message
  * from injecting escape sequences (e.g. a bracketed-paste terminator that would
@@ -363,18 +357,14 @@ export function resolveAgyPaneFromList(
  * inbound time so we can reply with an error and inject nothing when the pane
  * can't be found (fail-safe, as in remote-control).
  */
-export function resolveAgyPane(session: string, tab: string, paneName?: string): AgyPaneResolution {
+export async function resolveAgyPane(session: string, tab: string, paneName?: string): Promise<AgyPaneResolution> {
   const zellij = resolveZellij()
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
-  try {
-    const out = execFileSync(zellij, ['--session', session, 'action', 'list-panes', '--all'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    return resolveAgyPaneFromList(parseListPanes(out), { tab, paneName })
-  } catch (err) {
-    return { ok: false, error: zellijError(err, 'list-panes') }
-  }
+  // Read-only pre-check: the cache is safe. `injectAgyProse` re-resolves with a
+  // forced-fresh read before it types anything.
+  const list = await listPanes(session)
+  if (!list.ok) return { ok: false, error: list.error }
+  return resolveAgyPaneFromList(list.panes, { tab, paneName })
 }
 
 /**
@@ -394,38 +384,30 @@ export async function injectAgyProse(opts: {
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
   const base = ['--session', opts.session, 'action']
 
-  let panesOut: string
-  try {
-    panesOut = execFileSync(zellij, [...base, 'list-panes', '--all'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-  } catch (err) {
-    return { ok: false, error: zellijError(err, 'list-panes') }
-  }
+  // Forced-fresh: never type into a pane resolved from a stale pane list.
+  const list = await listPanes(opts.session, { maxAgeMs: 0 })
+  if (!list.ok) return { ok: false, error: list.error }
 
-  const resolved = resolveAgyPaneFromList(parseListPanes(panesOut), { tab: opts.tab, paneName: opts.paneName })
+  const resolved = resolveAgyPaneFromList(list.panes, { tab: opts.tab, paneName: opts.paneName })
   if (!resolved.ok) return { ok: false, error: resolved.error }
   const paneId = resolved.paneId
 
   const message = sanitizeProse(opts.message)
   if (!message.trim()) return { ok: false, error: 'empty message after sanitization' }
 
-  try {
-    try {
-      execFileSync(zellij, [...base, 'focus-pane-id', paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch (err) {
-      // zellij exits non-zero if the pane is ALREADY focused — tolerate that
-      // and proceed; rethrow any other focus failure.
-      if (!/already focused/i.test(zellijError(err, 'focus'))) throw err
-    }
-    const payload = needsBracketedPaste(message) ? buildPasteSequence(message) : message
-    execFileSync(zellij, [...base, 'write-chars', payload], { stdio: ['ignore', 'pipe', 'pipe'] })
-    // 13 = carriage return (Enter) to submit.
-    execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
-  } catch (err) {
-    return { ok: false, error: zellijError(err, 'inject') }
+  const focus = await runZellij(zellij, [...base, 'focus-pane-id', paneId], 'focus')
+  // zellij exits non-zero if the pane is ALREADY focused — tolerate that and
+  // proceed; any other focus failure is fatal.
+  if (!focus.ok && !/already focused/i.test(focus.error)) {
+    return { ok: false, error: focus.error }
   }
+
+  const payload = needsBracketedPaste(message) ? buildPasteSequence(message) : message
+  const chars = await runZellij(zellij, [...base, 'write-chars', payload], 'inject')
+  if (!chars.ok) return { ok: false, error: chars.error }
+  // 13 = carriage return (Enter) to submit.
+  const enter = await runZellij(zellij, [...base, 'write', '13'], 'inject')
+  if (!enter.ok) return { ok: false, error: enter.error }
 
   return { ok: true }
 }

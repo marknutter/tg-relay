@@ -29,6 +29,11 @@
  *   key + Enter. Tested with a stub zellij binary forced via the
  *   TG_RELAY_ZELLIJ env var; the resolved path is cached so we call
  *   _resetZellijCache() before each env change.
+ *
+ *   listPanes(session, { maxAgeMs? }) — side-effecting, ASYNC. Wraps
+ *   `list-panes --all` with a per-session TTL cache and single-flight
+ *   de-duplication (issue #95). The pane list is ALSO cached across tests, so
+ *   _resetPanesCache() runs alongside _resetZellijCache() in setup.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
@@ -51,6 +56,9 @@ import {
   SUPPORTED_COMMANDS,
   DEFAULT_PANE_NAME,
   _resetZellijCache,
+  _resetPanesCache,
+  listPanes,
+  ZELLIJ_PANES_TTL_MS,
 } from '../src/remote-control.ts'
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -696,12 +704,14 @@ describe('injectCommand', () => {
 
   beforeEach(() => {
     _resetZellijCache()
+    _resetPanesCache()
     dir = mkdtempSync(join(tmpdir(), 'tg-relay-inject-'))
   })
 
   afterEach(() => {
     delete process.env.TG_RELAY_ZELLIJ
     _resetZellijCache()
+    _resetPanesCache()
     if (dir && existsSync(dir)) {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -1119,5 +1129,175 @@ describe('injectCommand', () => {
       expect(line).not.toContain('write-chars')
       expect(line).not.toContain('write 13')
     }
+  })
+})
+
+// ─── listPanes — TTL cache + single-flight (issue #95) ───────────────────
+//
+// `zellij action list-panes --all` costs ~6s on a large session, and it used
+// to run once per channel per poll through blocking execFileSync — which
+// froze the daemon's event loop and starved the presence endpoint. These
+// tests pin the two properties that fix it: results are reused within a TTL,
+// and concurrent callers share ONE subprocess.
+
+describe('listPanes (pane-list cache)', () => {
+  let dir: string
+
+  beforeEach(() => {
+    _resetZellijCache()
+    _resetPanesCache()
+    dir = mkdtempSync(join(tmpdir(), 'tg-relay-panes-'))
+  })
+
+  afterEach(() => {
+    delete process.env.TG_RELAY_ZELLIJ
+    _resetZellijCache()
+    _resetPanesCache()
+    if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  })
+
+  const TABLE = [
+    'TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS',
+    '5  3  t  terminal_44  terminal  Work  claude --resume deadbeef  /tmp/t  false  false  false  0  1  43  75',
+  ].join('\n')
+
+  /**
+   * Stub zellij that appends one line to <counter> per `list-panes` call, so a
+   * test can assert exactly how many subprocesses were spawned. `delayMs`
+   * makes the call slow enough to overlap concurrent callers.
+   */
+  function writeCountingStub(delayMs = 0): { stub: string; counter: string } {
+    const stub = join(dir, 'zellij-count.sh')
+    const counter = join(dir, 'calls.log')
+    writeFileSync(counter, '')
+    const script = [
+      '#!/usr/bin/env bash',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "list-panes" ]; then',
+      `    printf 'call\\n' >> ${JSON.stringify(counter)}`,
+      ...(delayMs > 0 ? [`    sleep ${(delayMs / 1000).toFixed(2)}`] : []),
+      `    cat <<'PANES'`,
+      TABLE,
+      'PANES',
+      '    exit 0',
+      '  fi',
+      'done',
+      'exit 0',
+    ].join('\n')
+    writeFileSync(stub, script)
+    chmodSync(stub, 0o755)
+    process.env.TG_RELAY_ZELLIJ = stub
+    _resetZellijCache()
+    return { stub, counter }
+  }
+
+  const callCount = (counter: string): number =>
+    readFileSync(counter, 'utf8').split('\n').filter((l) => l.length > 0).length
+
+  test('a second call within the TTL is served from cache (one zellij invocation)', async () => {
+    const { counter } = writeCountingStub()
+
+    const first = await listPanes('s', { maxAgeMs: 60_000 })
+    const second = await listPanes('s', { maxAgeMs: 60_000 })
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (first.ok && second.ok) {
+      expect(first.panes).toEqual(second.panes)
+      expect(second.panes[0]?.paneId).toBe('terminal_44')
+    }
+    expect(callCount(counter)).toBe(1)
+  })
+
+  test('an entry older than maxAgeMs is refetched', async () => {
+    const { counter } = writeCountingStub()
+
+    await listPanes('s', { maxAgeMs: 30 })
+    await new Promise((r) => setTimeout(r, 60))
+    await listPanes('s', { maxAgeMs: 30 })
+
+    expect(callCount(counter)).toBe(2)
+  })
+
+  test('maxAgeMs: 0 always forces a fresh read', async () => {
+    const { counter } = writeCountingStub()
+
+    await listPanes('s', { maxAgeMs: 0 })
+    await listPanes('s', { maxAgeMs: 0 })
+    await listPanes('s', { maxAgeMs: 0 })
+
+    expect(callCount(counter)).toBe(3)
+  })
+
+  test('caches per session — a different session is fetched separately', async () => {
+    const { counter } = writeCountingStub()
+
+    await listPanes('one', { maxAgeMs: 60_000 })
+    await listPanes('two', { maxAgeMs: 60_000 })
+    await listPanes('one', { maxAgeMs: 60_000 })
+
+    expect(callCount(counter)).toBe(2)
+  })
+
+  test('concurrent callers share ONE in-flight invocation (single-flight)', async () => {
+    // A slow stub guarantees the calls genuinely overlap. This is the property
+    // that collapses N per-channel pollers into a single subprocess.
+    const { counter } = writeCountingStub(300)
+
+    const results = await Promise.all([
+      listPanes('s', { maxAgeMs: 0 }),
+      listPanes('s', { maxAgeMs: 0 }),
+      listPanes('s', { maxAgeMs: 0 }),
+      listPanes('s', { maxAgeMs: 0 }),
+      listPanes('s', { maxAgeMs: 0 }),
+    ])
+
+    for (const r of results) expect(r.ok).toBe(true)
+    expect(callCount(counter)).toBe(1)
+  })
+
+  test('single-flight completes, then a later forced-fresh call refetches', async () => {
+    const { counter } = writeCountingStub(50)
+
+    await Promise.all([listPanes('s', { maxAgeMs: 0 }), listPanes('s', { maxAgeMs: 0 })])
+    expect(callCount(counter)).toBe(1)
+
+    // The in-flight entry must be released once settled, not leaked forever.
+    await listPanes('s', { maxAgeMs: 0 })
+    expect(callCount(counter)).toBe(2)
+  })
+
+  test('missing zellij binary → { ok: false }, never throws', async () => {
+    process.env.TG_RELAY_ZELLIJ = join(dir, 'does-not-exist')
+    _resetZellijCache()
+
+    const r = await listPanes('s', { maxAgeMs: 0 })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(typeof r.error).toBe('string')
+  })
+
+  test('zellij failure is not cached — a later success is returned', async () => {
+    const failing = join(dir, 'zellij-fail.sh')
+    writeFileSync(failing, '#!/usr/bin/env bash\necho boom >&2\nexit 1\n')
+    chmodSync(failing, 0o755)
+    process.env.TG_RELAY_ZELLIJ = failing
+    _resetZellijCache()
+
+    const bad = await listPanes('s', { maxAgeMs: 60_000 })
+    expect(bad.ok).toBe(false)
+
+    const { counter } = writeCountingStub()
+    const good = await listPanes('s', { maxAgeMs: 60_000 })
+    expect(good.ok).toBe(true)
+    expect(callCount(counter)).toBe(1)
+  })
+
+  test('ZELLIJ_PANES_TTL_MS is a positive default used when maxAgeMs is omitted', async () => {
+    expect(ZELLIJ_PANES_TTL_MS).toBeGreaterThan(0)
+
+    const { counter } = writeCountingStub()
+    await listPanes('s')
+    await listPanes('s')
+    expect(callCount(counter)).toBe(1)
   })
 })
