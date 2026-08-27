@@ -21,9 +21,12 @@
  *     focused pane is a shell rather than Claude.
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 /** Per-channel opt-in config, stored on `access.json` under `remoteControl`. */
 export type RemoteControlConfig = {
@@ -357,6 +360,99 @@ export function zellijError(err: unknown, what: string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+// ── async zellij runner + pane-list cache (#95) ─────────────────────────────
+//
+// Every zellij shell-out here used to be `execFileSync`, which blocks the
+// daemon's single Bun event loop for the whole duration of the subprocess.
+// That is fine when zellij answers in milliseconds and catastrophic when it
+// doesn't: `list-panes --all` costs ~6s on a session with ~50 panes, and with
+// one halt-watch poller per channel the loop was blocked ~96% of the time —
+// starving the presence HTTP endpoint until the picker hook's read timed out.
+//
+// Two changes fix that class of failure rather than the one symptom:
+//   1. `runZellij` is async, so a slow zellij delays one operation instead of
+//      freezing the daemon.
+//   2. `listPanes` caches per session and collapses concurrent callers into a
+//      single invocation, so N channels polling together cost one zellij run.
+
+/** Generous cap so a large `dump-screen` can't trip execFile's 1 MB default. */
+const ZELLIJ_MAX_BUFFER = 10 * 1024 * 1024
+
+export type ZellijRun = { ok: true; stdout: string } | { ok: false; error: string }
+
+/**
+ * Run a zellij subcommand without blocking the event loop. Mirrors the fail-soft
+ * contract of the rest of this module: never throws, returns `{ ok: false }`.
+ */
+export async function runZellij(zellij: string, args: string[], what: string): Promise<ZellijRun> {
+  try {
+    const { stdout } = await execFileAsync(zellij, args, {
+      encoding: 'utf8',
+      maxBuffer: ZELLIJ_MAX_BUFFER,
+    })
+    return { ok: true, stdout }
+  } catch (err) {
+    return { ok: false, error: zellijError(err, what) }
+  }
+}
+
+/** How long a cached pane list stays usable (ms). */
+export const ZELLIJ_PANES_TTL_MS = parseInt(process.env.TG_RELAY_ZELLIJ_PANES_TTL_MS ?? '10000', 10)
+
+export type ListPanesResult = { ok: true; panes: PaneInfo[] } | { ok: false; error: string }
+
+const panesCache = new Map<string, { ts: number; panes: PaneInfo[] }>()
+const panesInFlight = new Map<string, Promise<ListPanesResult>>()
+
+/**
+ * List every pane in `session`, cached for `maxAgeMs` (default
+ * `ZELLIJ_PANES_TTL_MS`). Pass `maxAgeMs: 0` to force a fresh read — injection
+ * paths must do this, because acting on a stale pane id could land a keystroke
+ * in the wrong pane. Read-only pollers should take the cache.
+ *
+ * Concurrent calls for the same session share one in-flight zellij invocation,
+ * so a fleet of per-channel pollers ticking together costs a single subprocess.
+ */
+export async function listPanes(
+  session: string,
+  opts: { maxAgeMs?: number } = {},
+): Promise<ListPanesResult> {
+  const maxAge = opts.maxAgeMs ?? ZELLIJ_PANES_TTL_MS
+
+  if (maxAge > 0) {
+    const hit = panesCache.get(session)
+    if (hit && Date.now() - hit.ts < maxAge) return { ok: true, panes: hit.panes }
+  }
+
+  // Single-flight: an in-flight read is by definition fresh, so even a
+  // forced-fresh caller can safely await it instead of spawning a duplicate.
+  const existing = panesInFlight.get(session)
+  if (existing) return existing
+
+  const flight = (async (): Promise<ListPanesResult> => {
+    const zellij = resolveZellij()
+    if (!zellij) return { ok: false, error: 'zellij binary not found' }
+    const run = await runZellij(zellij, ['--session', session, 'action', 'list-panes', '--all'], 'list-panes')
+    if (!run.ok) return { ok: false, error: run.error }
+    const panes = parseListPanes(run.stdout)
+    panesCache.set(session, { ts: Date.now(), panes })
+    return { ok: true, panes }
+  })()
+
+  panesInFlight.set(session, flight)
+  try {
+    return await flight
+  } finally {
+    panesInFlight.delete(session)
+  }
+}
+
+/** Drop cached pane lists — tests only. */
+export function _resetPanesCache(): void {
+  panesCache.clear()
+  panesInFlight.clear()
+}
+
 // Confirmation-dialog polling: how long to wait for the dialog to render, and
 // how often to re-read the pane while waiting.
 const CONFIRM_POLL_ATTEMPTS = 8
@@ -380,35 +476,27 @@ export async function injectCommand(opts: {
   if (!zellij) return { ok: false, error: 'zellij binary not found' }
   const base = ['--session', opts.session, 'action']
 
-  let panesOut: string
-  try {
-    panesOut = execFileSync(zellij, [...base, 'list-panes', '--all'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-  } catch (err) {
-    return { ok: false, error: zellijError(err, 'list-panes') }
-  }
+  // Forced-fresh: never type into a pane resolved from a stale pane list.
+  const list = await listPanes(opts.session, { maxAgeMs: 0 })
+  if (!list.ok) return { ok: false, error: list.error }
 
-  const resolved = resolveTargetPane(parseListPanes(panesOut), { tab: opts.tab })
+  const resolved = resolveTargetPane(list.panes, { tab: opts.tab })
   if (!resolved.ok) return { ok: false, error: resolved.error }
   const paneId = resolved.paneId
 
-  try {
-    try {
-      execFileSync(zellij, [...base, 'focus-pane-id', paneId], { stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch (err) {
-      // zellij exits non-zero if the pane is ALREADY focused — that's exactly
-      // the state we want (common when a prior command already switched to it),
-      // so tolerate it and proceed. Rethrow any other focus failure.
-      if (!/already focused/i.test(zellijError(err, 'focus'))) throw err
-    }
-    execFileSync(zellij, [...base, 'write-chars', opts.commandLine], { stdio: ['ignore', 'pipe', 'pipe'] })
-    // 13 = carriage return (Enter) to submit the command.
-    execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
-  } catch (err) {
-    return { ok: false, error: zellijError(err, 'inject') }
+  const focus = await runZellij(zellij, [...base, 'focus-pane-id', paneId], 'focus')
+  // zellij exits non-zero if the pane is ALREADY focused — that's exactly the
+  // state we want (common when a prior command already switched to it), so
+  // tolerate it and proceed. Any other focus failure is fatal.
+  if (!focus.ok && !/already focused/i.test(focus.error)) {
+    return { ok: false, error: focus.error }
   }
+
+  const chars = await runZellij(zellij, [...base, 'write-chars', opts.commandLine], 'inject')
+  if (!chars.ok) return { ok: false, error: chars.error }
+  // 13 = carriage return (Enter) to submit the command.
+  const enter = await runZellij(zellij, [...base, 'write', '13'], 'inject')
+  if (!enter.ok) return { ok: false, error: enter.error }
 
   if (opts.confirm) {
     try {
@@ -438,18 +526,11 @@ async function handleConfirmation(
   const re = new RegExp(confirm.detectPattern, 'i')
   for (let i = 0; i < CONFIRM_POLL_ATTEMPTS; i++) {
     await sleep(CONFIRM_POLL_INTERVAL_MS)
-    let screen = ''
-    try {
-      screen = execFileSync(zellij, [...base, 'dump-screen', '--pane-id', paneId], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    } catch {
-      continue // transient read failure — try again
-    }
-    if (re.test(screen)) {
-      execFileSync(zellij, [...base, 'write-chars', confirm.key], { stdio: ['ignore', 'pipe', 'pipe'] })
-      execFileSync(zellij, [...base, 'write', '13'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const dump = await runZellij(zellij, [...base, 'dump-screen', '--pane-id', paneId], 'dump-screen')
+    if (!dump.ok) continue // transient read failure — try again
+    if (re.test(dump.stdout)) {
+      await runZellij(zellij, [...base, 'write-chars', confirm.key], 'confirm')
+      await runZellij(zellij, [...base, 'write', '13'], 'confirm')
       return
     }
   }

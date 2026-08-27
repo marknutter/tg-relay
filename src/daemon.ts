@@ -1487,7 +1487,7 @@ async function handleAgyInbound(
   }
   const tab = rt.config.zellijTab || state.config.name
   // Fail-safe: if the agy pane can't be resolved, reply and inject nothing.
-  const pane = resolveAgyPane(rt.config.zellijSession, tab, rt.config.paneName)
+  const pane = await resolveAgyPane(rt.config.zellijSession, tab, rt.config.paneName)
   if (!pane.ok) {
     await state.bot.api.sendMessage(chatId, `⚠️ couldn't reach agy: ${pane.error}`).catch(() => {})
     log(state.config.name, `agy: pane unresolved, message rejected: ${pane.error}`)
@@ -1564,7 +1564,7 @@ async function haltWatchTick(state: ChannelState): Promise<void> {
   rt.ticking = true
   try {
     const tab = rc.zellijTab || state.config.name
-    const read = readPaneScreen(rc.zellijSession, tab)
+    const read = await readPaneScreen(rc.zellijSession, tab)
     if (!read.ok) return // pane not resolvable this tick — leave episode state untouched
 
     const { state: next, shouldAlert } = advanceHaltState(rt.state, read.screen, HALT_PERSIST_TICKS)

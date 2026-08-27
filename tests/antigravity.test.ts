@@ -52,7 +52,7 @@ import {
   type AgyRecord,
   type AntigravityState,
 } from '../src/antigravity.js'
-import { _resetZellijCache, type PaneInfo } from '../src/remote-control.js'
+import { _resetZellijCache, _resetPanesCache, type PaneInfo } from '../src/remote-control.js'
 
 const FIXTURE = join(import.meta.dir, 'fixtures', 'agy-transcript.jsonl')
 
@@ -682,12 +682,17 @@ describe('agy pane injection', () => {
 
   beforeEach(() => {
     _resetZellijCache()
+    // The pane-list cache is keyed by session name, and these tests reuse
+    // session "s" with different stub tables — clear it or one test's panes
+    // leak into the next.
+    _resetPanesCache()
     dir = mkdtempSync(join(tmpdir(), 'agy-inject-'))
   })
 
   afterEach(() => {
     delete process.env.TG_RELAY_ZELLIJ
     _resetZellijCache()
+    _resetPanesCache()
     if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true })
   })
 
@@ -760,22 +765,22 @@ describe('agy pane injection', () => {
   // ─── resolveAgyPane (non-typing) ───────────────────────────────────────
 
   describe('resolveAgyPane', () => {
-    test('tab with an agy pane (plus claude + shell) → ok, targets the agy pane', () => {
+    test('tab with an agy pane (plus claude + shell) → ok, targets the agy pane', async () => {
       const { stub } = writeStub(TABLE_WITH_AGY)
       process.env.TG_RELAY_ZELLIJ = stub
       _resetZellijCache()
 
-      const r = resolveAgyPane('s', 't')
+      const r = await resolveAgyPane('s', 't')
       expect(r.ok).toBe(true)
       if (r.ok) expect(r.paneId).toBe('terminal_44')
     })
 
-    test('tab with NO agy pane → { ok: false }', () => {
+    test('tab with NO agy pane → { ok: false }', async () => {
       const { stub } = writeStub(TABLE_NO_AGY)
       process.env.TG_RELAY_ZELLIJ = stub
       _resetZellijCache()
 
-      const r = resolveAgyPane('s', 't')
+      const r = await resolveAgyPane('s', 't')
       expect(r.ok).toBe(false)
       if (!r.ok) expect(typeof r.error).toBe('string')
     })
