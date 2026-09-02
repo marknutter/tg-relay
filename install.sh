@@ -195,32 +195,50 @@ if [ -f "$HOOK_SRC" ]; then
   fi
 fi
 
-# 5. Install claude-channel-add helper into ~/bin
+# 5. Install claude-channel-add helper
 echo ""
 echo "5. Installing claude-channel-add helper..."
 
-BIN_DIR="$HOME/bin"
 BIN_SRC="$SCRIPT_DIR/bin/claude-channel-add"
-BIN_DST="$BIN_DIR/claude-channel-add"
 
+# Install into BOTH ~/.claude/bin and ~/bin.
+#
+# ~/.claude/bin is where the helper actually ended up on this machine and it is
+# what PATH resolves, but earlier versions of this installer only wrote ~/bin —
+# so the copy people were really running went stale and silently lacked newer
+# flags (--link-dir, --remote-control, ...). Writing both keeps whichever one
+# PATH prefers correct, rather than depending on which directory wins.
 if [ -f "$BIN_SRC" ]; then
-  mkdir -p "$BIN_DIR"
-  # If an older version is already present, replace it; preserving backup once.
-  if [ -f "$BIN_DST" ] && ! cmp -s "$BIN_SRC" "$BIN_DST"; then
-    [ -f "$BIN_DST.bak" ] || cp "$BIN_DST" "$BIN_DST.bak"
-  fi
-  cp "$BIN_SRC" "$BIN_DST"
-  chmod +x "$BIN_DST"
-  echo "   Installed: $BIN_DST"
+  for BIN_DIR in "$HOME/.claude/bin" "$HOME/bin"; do
+    BIN_DST="$BIN_DIR/claude-channel-add"
+    mkdir -p "$BIN_DIR"
+    # If an older version is already present, replace it; preserving backup once.
+    if [ -f "$BIN_DST" ] && ! cmp -s "$BIN_SRC" "$BIN_DST"; then
+      [ -f "$BIN_DST.bak" ] || cp "$BIN_DST" "$BIN_DST.bak"
+    fi
+    cp "$BIN_SRC" "$BIN_DST"
+    chmod +x "$BIN_DST"
+    echo "   Installed: $BIN_DST"
+  done
 
   case ":$PATH:" in
-    *":$BIN_DIR:"*) : ;;  # already on PATH, nothing to say
+    *":$HOME/.claude/bin:"*) : ;;
+    *":$HOME/bin:"*) : ;;
     *)
-      echo "   Note: $BIN_DIR is not on your PATH."
+      echo "   Note: neither ~/.claude/bin nor ~/bin is on your PATH."
       echo "   Add this to your ~/.zshrc (or equivalent):"
-      echo "     export PATH=\"\$HOME/bin:\$PATH\""
+      echo "     export PATH=\"\$HOME/.claude/bin:\$PATH\""
       ;;
   esac
+
+  # Surface any OTHER claude-channel-add earlier on PATH — it would shadow the
+  # one we just installed and reintroduce exactly the staleness this fixes.
+  RESOLVED="$(command -v claude-channel-add 2>/dev/null || true)"
+  if [ -n "$RESOLVED" ] && ! cmp -s "$BIN_SRC" "$RESOLVED"; then
+    echo "   Warning: '$RESOLVED' is first on PATH and differs from the version"
+    echo "            just installed. Remove or update it, or the skill will run"
+    echo "            a stale helper."
+  fi
 fi
 
 # 6. Set up shell alias

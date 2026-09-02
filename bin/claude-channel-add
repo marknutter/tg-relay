@@ -1,16 +1,36 @@
 #!/usr/bin/env bash
-# Usage: claude-channel-add <name> <bot-token> [--owner <telegram-user-id>]
+# Usage: claude-channel-add <name> <bot-token> [options]
 # Example: claude-channel-add mtl 8675038482:AAE1GTuG...
 #
-# Creates a tg-relay Telegram channel for a Claude Code project:
-#   1. Creates state dir at ~/.claude/channels/telegram-<name>/
-#   2. Saves the bot token to .env
-#   3. Allowlists your Telegram user ID (no pairing dance)
+# Creates (or updates) a tg-relay Telegram channel for a Claude Code project:
+#   1. Verifies the token against Telegram's getMe, so a typo fails here
+#      rather than as a polling error buried in the router log
+#   2. Creates state dir at ~/.claude/channels/telegram-<name>/
+#   3. Saves the bot token to .env (chmod 600)
+#   4. Allowlists your Telegram user ID (no pairing dance)
+#   5. Optionally wires remote-control (zellij) and the project's
+#      .claude-channel file, and waits for the daemon to pick it up
+#
+# Options:
+#   --owner <id>             Telegram user ID to allowlist
+#   --link-dir <path>        Write <path>/.claude-channel so sessions in that
+#                            project resolve to this channel. REFUSES to
+#                            clobber a file naming a different channel unless
+#                            --force is given — a stale .claude-channel
+#                            silently relays a project through the wrong bot,
+#                            which is invisible until you notice replies
+#                            arriving on someone else's bot.
+#   --remote-control [sess]  Add the remoteControl block (default session
+#                            "main", tab = <name>). Warns if the tab is missing.
+#   --wait [seconds]         Wait for the daemon to report "polling as @bot"
+#                            (default 60). Exits non-zero if it never does.
+#   --no-verify              Skip the getMe check (offline / CI)
+#   --force                  Overwrite an existing token or a conflicting
+#                            .claude-channel
 #
 # After running: the tg-relay daemon picks up the new channel within 30s.
-# Start a session with `claude!` from a directory named <name> or containing
-# a .claude-channel file with that name — the plugin resolves the channel
-# from cwd automatically.
+# NOTE: Claude sessions ALREADY running in the project resolved their channel
+# at startup and keep the old routing until restarted.
 #
 # The owner Telegram user ID is resolved in this order:
 #   1. --owner <id> flag
@@ -21,8 +41,19 @@
 
 set -euo pipefail
 
+CHANNELS_ROOT="${TG_RELAY_CHANNELS_ROOT:-$HOME/.claude/channels}"
+ROUTER_LOG="$CHANNELS_ROOT/telegram-router.log"
+
 usage() {
-  echo "Usage: claude-channel-add <name> <bot-token> [--owner <telegram-user-id>]"
+  echo "Usage: claude-channel-add <name> <bot-token> [options]"
+  echo ""
+  echo "Options:"
+  echo "  --owner <id>            Telegram user ID to allowlist"
+  echo "  --link-dir <path>       Write <path>/.claude-channel = <name>"
+  echo "  --remote-control [sess] Add remoteControl block (default session 'main')"
+  echo "  --wait [seconds]        Wait for the daemon to start polling (default 60)"
+  echo "  --no-verify             Skip the Telegram getMe check"
+  echo "  --force                 Overwrite an existing token / conflicting .claude-channel"
   echo ""
   echo "Example:"
   echo "  claude-channel-add mtl 8675038482:AAE1GTuG..."
@@ -36,24 +67,32 @@ token="$2"
 shift 2
 
 owner=""
+link_dir=""
+remote_control=""
+rc_session="main"
+wait_secs=""
+verify=1
+force=0
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --owner) owner="$2"; shift 2 ;;
+    --owner) owner="${2:-}"; shift 2 ;;
+    --link-dir) link_dir="${2:-}"; shift 2 ;;
+    --remote-control)
+      remote_control=1
+      # Optional session name: consume the next arg only if it isn't a flag.
+      if [[ $# -ge 2 && "${2:-}" != --* ]]; then rc_session="$2"; shift 2; else shift; fi
+      ;;
+    --wait)
+      if [[ $# -ge 2 && "${2:-}" != --* ]]; then wait_secs="$2"; shift 2; else wait_secs=60; shift; fi
+      ;;
+    --no-verify) verify=0; shift ;;
+    --force) force=1; shift ;;
     *) echo "Unknown arg: $1"; usage ;;
   esac
 done
 
-# Fall back to env var
-[[ -z "$owner" ]] && owner="${TG_RELAY_OWNER:-}"
-
-# Fall back to allowFrom[0] of any existing channel
-if [[ -z "$owner" ]]; then
-  for existing in "$HOME"/.claude/channels/telegram-*/access.json; do
-    [[ -f "$existing" ]] || continue
-    owner=$(grep -oE '"[0-9]+"' "$existing" | head -1 | tr -d '"')
-    [[ -n "$owner" ]] && break
-  done
-fi
+# ── validation ──────────────────────────────────────────────────────────────
 
 # Name: lowercase alphanumeric + hyphens only — keeps socket paths simple
 if [[ ! "$name" =~ ^[a-z0-9-]+$ ]]; then
@@ -67,11 +106,90 @@ if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
   exit 1
 fi
 
-state_dir="$HOME/.claude/channels/telegram-${name}"
+mask() { printf '%s...' "${1:0:12}"; }
+
+# Validate --link-dir up front. Checking this only at write time would leave a
+# half-created channel behind when the marker conflicts, so it belongs with the
+# other pre-flight checks: nothing is written until every input is known good.
+if [[ -n "$link_dir" ]]; then
+  if [[ ! -d "$link_dir" ]]; then
+    echo "Error: --link-dir '$link_dir' is not a directory."
+    exit 1
+  fi
+  if [[ -f "$link_dir/.claude-channel" ]]; then
+    current=$(tr -d '[:space:]' < "$link_dir/.claude-channel")
+    if [[ "$current" != "$name" && "$force" != "1" ]]; then
+      echo "Error: $link_dir/.claude-channel already points at '$current', not '$name'."
+      echo "       That routes this project's sessions to the '$current' bot."
+      echo "       Re-run with --force to repoint it."
+      exit 1
+    fi
+  fi
+fi
+
+# ── verify the token before writing anything ────────────────────────────────
+
+bot_username=""
+if [[ "$verify" == "1" ]]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Warning: curl not found — skipping token verification."
+  else
+    resp="$(curl -s -m 10 "https://api.telegram.org/bot${token}/getMe" || true)"
+    if [[ -z "$resp" ]]; then
+      echo "Error: couldn't reach api.telegram.org to verify the token."
+      echo "       Re-run with --no-verify to skip this check."
+      exit 1
+    fi
+    bot_username="$(printf '%s' "$resp" | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if d.get("ok"):
+    print(d["result"].get("username",""))
+' 2>/dev/null || true)"
+    if [[ -z "$bot_username" ]]; then
+      echo "Error: Telegram rejected this token ($(mask "$token"))."
+      printf '%s' "$resp" | python3 -c '
+import json,sys
+try: print("       " + str(json.load(sys.stdin).get("description","unknown error")))
+except Exception: pass
+' 2>/dev/null || true
+      exit 1
+    fi
+    echo "Token verified -> @${bot_username}"
+  fi
+fi
+
+# ── owner resolution ────────────────────────────────────────────────────────
+
+[[ -z "$owner" ]] && owner="${TG_RELAY_OWNER:-}"
+
+if [[ -z "$owner" ]]; then
+  for existing in "$CHANNELS_ROOT"/telegram-*/access.json; do
+    [[ -f "$existing" ]] || continue
+    owner=$(grep -oE '"[0-9]+"' "$existing" | head -1 | tr -d '"')
+    [[ -n "$owner" ]] && break
+  done
+fi
+
+# ── state dir ───────────────────────────────────────────────────────────────
+
+state_dir="$CHANNELS_ROOT/telegram-${name}"
+updating=0
 
 if [[ -d "$state_dir" ]]; then
-  echo "Error: $state_dir already exists. Delete it first if you want to recreate."
-  exit 1
+  updating=1
+  existing_token=""
+  if [[ -f "$state_dir/.env" ]]; then
+    existing_token=$(grep -oE '^TELEGRAM_BOT_TOKEN=.+$' "$state_dir/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)
+  fi
+  if [[ -n "$existing_token" && "$existing_token" != "$token" && "$force" != "1" ]]; then
+    echo "Error: channel '$name' already has a different token ($(mask "$existing_token"))."
+    echo "       Re-run with --force to replace it."
+    exit 1
+  fi
 fi
 
 mkdir -p "$state_dir/approved"
@@ -79,38 +197,141 @@ mkdir -p "$state_dir/approved"
 printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token" > "$state_dir/.env"
 chmod 600 "$state_dir/.env"
 
+# ── access.json ─────────────────────────────────────────────────────────────
+#
+# Merge rather than clobber: an existing channel may already have an allowlist,
+# groups, or heartbeats we must not drop when re-running to add remote-control.
+
+ACCESS_JSON="$state_dir/access.json" \
+OWNER="$owner" \
+REMOTE_CONTROL="${remote_control:-}" \
+RC_SESSION="$rc_session" \
+CHANNEL_NAME="$name" \
+python3 <<'PY'
+import json, os
+
+path = os.environ["ACCESS_JSON"]
+owner = os.environ.get("OWNER") or ""
+want_rc = os.environ.get("REMOTE_CONTROL") == "1"
+rc_session = os.environ["RC_SESSION"]
+name = os.environ["CHANNEL_NAME"]
+
+try:
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+except Exception:
+    data = {}
+
+data.setdefault("groups", {})
+data.setdefault("pending", {})
+
+allow = data.get("allowFrom")
+if not isinstance(allow, list):
+    allow = []
+
+if owner:
+    if owner not in allow:
+        allow.append(owner)
+    data["dmPolicy"] = "allowlist"
+else:
+    data.setdefault("dmPolicy", "pairing")
+
+data["allowFrom"] = allow
+
+if want_rc:
+    rc = data.get("remoteControl")
+    if not isinstance(rc, dict):
+        rc = {}
+    rc["enabled"] = True
+    rc["zellijSession"] = rc_session
+    rc.setdefault("zellijTab", name)
+    data["remoteControl"] = rc
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+
+chmod 600 "$state_dir/access.json"
+
 if [[ -n "$owner" ]]; then
-  cat > "$state_dir/access.json" <<EOF
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": [
-    "$owner"
-  ],
-  "groups": {},
-  "pending": {}
-}
-EOF
   # The approval marker is what the daemon polls to send the "Paired!"
-  # confirmation, so pre-seeding skips that.
-  echo "$owner" > "$state_dir/approved/$owner"
-  echo "Owner $owner pre-allowlisted. Bot is ready to receive messages from you."
+  # confirmation, so pre-seeding skips that. Only for brand-new channels —
+  # re-running shouldn't re-send it.
+  if [[ "$updating" != "1" ]]; then
+    echo "$owner" > "$state_dir/approved/$owner"
+  fi
+  echo "Owner $owner allowlisted. Bot is ready to receive messages from you."
 else
-  cat > "$state_dir/access.json" <<'EOF'
-{
-  "dmPolicy": "pairing",
-  "allowFrom": [],
-  "groups": {},
-  "pending": {}
-}
-EOF
   echo "No owner ID provided — channel opens in pairing mode."
   echo "Next: DM the bot, get a 6-char code, run '/telegram:access pair <code>' in a session."
 fi
 
+# ── remote-control sanity ───────────────────────────────────────────────────
+
+if [[ "${remote_control:-}" == "1" ]]; then
+  echo "Remote control enabled (zellij session '$rc_session', tab '$name')."
+  if command -v zellij >/dev/null 2>&1; then
+    # query-tab-names is the cheap call (~70ms); list-panes is pathologically
+    # slow on large sessions, so never use it just to check a tab exists.
+    if tabs=$(zellij --session "$rc_session" action query-tab-names 2>/dev/null); then
+      # zellij decorates tabs that have unseen activity with a leading emoji
+      # ("🔔 selvedge"), so an exact match on the bare name spuriously reports
+      # the tab as missing. Strip any leading non-name characters first —
+      # channel names are [a-z0-9-] by validation above.
+      if ! printf '%s\n' "$tabs" \
+           | sed 's/^[^A-Za-z0-9_-]*//; s/[[:space:]]*$//' \
+           | grep -qx "$name"; then
+        echo "  Warning: no zellij tab named '$name' in session '$rc_session'."
+        echo "           Remote control and halt alerts stay inert until one exists."
+        echo "           Create it with:  zellij --session $rc_session action new-tab --name $name"
+      fi
+    else
+      echo "  Warning: couldn't query zellij session '$rc_session' (not running?)."
+    fi
+  else
+    echo "  Warning: zellij not found on PATH — can't verify the tab exists."
+  fi
+fi
+
+# ── .claude-channel linking ─────────────────────────────────────────────────
+
+if [[ -n "$link_dir" ]]; then
+  # Conflicts were already rejected in pre-flight, so this is just the write.
+  printf '%s\n' "$name" > "$link_dir/.claude-channel"
+  echo "Linked $link_dir -> channel '$name'"
+fi
+
+# ── wait for the daemon to pick it up ───────────────────────────────────────
+
 echo ""
-echo "Channel '$name' created at $state_dir"
-echo "The tg-relay daemon will pick it up within 30s (see ~/.claude/channels/telegram-router.log)."
+if [[ -n "$wait_secs" ]]; then
+  echo -n "Waiting up to ${wait_secs}s for the daemon to start polling"
+  deadline=$(( SECONDS + wait_secs ))
+  seen=0
+  while (( SECONDS < deadline )); do
+    if [[ -f "$ROUTER_LOG" ]] && grep -q "\[$name\] polling as" "$ROUTER_LOG" 2>/dev/null; then
+      seen=1; break
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo ""
+  if [[ "$seen" == "1" ]]; then
+    grep "\[$name\] polling as" "$ROUTER_LOG" | tail -1
+    echo "Channel '$name' is live."
+  else
+    echo "Warning: didn't see '[$name] polling as' in the router log within ${wait_secs}s."
+    echo "         Check: tail -f $ROUTER_LOG"
+    exit 1
+  fi
+else
+  echo "Channel '$name' created at $state_dir"
+  echo "The tg-relay daemon will pick it up within 30s (see $ROUTER_LOG)."
+fi
+
 echo ""
-echo "To start a session for this channel:"
-echo "  cd ~/Kode/$name   # or any dir, then drop: echo $name > .claude-channel"
-echo "  claude!"
+echo "Note: Claude sessions already running in this project resolved their"
+echo "      channel at startup and keep the old routing until restarted."
