@@ -43,6 +43,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,56 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
+
+
+def chunk_text(text: str, max_chars: int = 250) -> list[str]:
+    """Split text into sentence-sized chunks under max_chars.
+
+    Chatterbox Turbo is an autoregressive model whose attention drifts into
+    garbled phonemes on inputs longer than ~250-300 characters. Splitting at
+    sentence boundaries and concatenating the resulting waveforms keeps every
+    generation step inside the model's coherent window.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    raw_sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    current: list[str] = []
+    current_len = 0
+
+    for s in raw_sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > max_chars:
+            clauses = re.split(r"(?<=[,;:])\s+", s)
+            for cl in clauses:
+                cl = cl.strip()
+                if not cl:
+                    continue
+                if current_len + len(cl) + 1 <= max_chars:
+                    current.append(cl)
+                    current_len += len(cl) + 1
+                else:
+                    if current:
+                        chunks.append(" ".join(current))
+                    current = [cl]
+                    current_len = len(cl)
+        elif current_len + len(s) + 1 <= max_chars:
+            current.append(s)
+            current_len += len(s) + 1
+        else:
+            if current:
+                chunks.append(" ".join(current))
+            current = [s]
+            current_len = len(s)
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks or [text]
 
 # NOTE: torch and the engine packages (which pull in hundreds of MB just to
 # import) and soundfile are imported LAZILY inside the engine load()/synth()
@@ -149,14 +200,31 @@ class ChatterboxEngine:
             self._model.prepare_conditionals(str(ref_audio), exaggeration=exaggeration)
             self._conds_key = key
 
-        wav = self._model.generate(
-            text,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
-            temperature=temperature,
-        )
-        # generate() returns a watermarked float tensor shaped (1, N).
-        samples = wav.squeeze(0).cpu().numpy()
+        chunks = chunk_text(text, max_chars=250)
+        if len(chunks) == 1:
+            wav = self._model.generate(
+                chunks[0],
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+            )
+            samples = wav.squeeze(0).cpu().numpy()
+        else:
+            import numpy as np
+
+            sr = int(self._model.sr)
+            silence = np.zeros(int(sr * 0.12), dtype=np.float32)  # 120ms natural inter-sentence pause
+            pieces = []
+            for ch in chunks:
+                wav = self._model.generate(
+                    ch,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                )
+                pieces.append(wav.squeeze(0).cpu().numpy())
+                pieces.append(silence)
+            samples = np.concatenate(pieces[:-1])
 
         # Hand the transient activation blocks back to the driver. Torch's
         # caching allocator holds them otherwise, and on an 8 GB card shared
