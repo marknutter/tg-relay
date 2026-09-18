@@ -61,6 +61,7 @@ from pydantic import BaseModel
 HOME = Path.home()
 CHANNELS_ROOT = HOME / ".claude" / "channels"
 GLOBAL_REF_DIR = HOME / ".cache" / "tg-relay-tts"
+PULSE_VOICES_DIR = HOME / ".pulse" / "voices"
 
 ENGINE_NAME = os.environ.get("TG_RELAY_TTS_ENGINE", "chatterbox").strip().lower()
 
@@ -265,19 +266,43 @@ threading.Thread(target=_idle_restart_loop, daemon=True, name="tts-idle-restart"
 
 # ── Reference resolution ────────────────────────────────────────────────────
 
-def resolve_reference(channel: str, need_text: bool) -> tuple[Path, str | None] | None:
-    """Return (ref_audio_path, ref_text_or_None) for a channel, or None.
+def resolve_reference(voice_or_channel: str | None, need_text: bool) -> tuple[Path, str | None] | None:
+    """Return (ref_audio_path, ref_text_or_None) for a voice or channel, or None.
 
-    need_text mirrors the active engine: F5 cannot synthesize without an exact
-    transcript, so a wav-only directory is not a usable reference for it and we
-    keep looking (and ultimately 404). Chatterbox clones from audio alone, so a
-    bare reference.wav is enough — but the transcript is still read when present
-    so a directory set up for F5 keeps working unchanged.
+    If a specific voice/channel is requested, searches ~/.pulse/voices and
+    ~/.claude/channels. If it cannot be resolved, returns None (causing 404).
+    Crucially, it does NOT silently fall back to GLOBAL_REF_DIR when a specific
+    voice was requested.
+
+    GLOBAL_REF_DIR is only consulted when voice_or_channel is empty/None or 'default'.
     """
-    candidates = [
-        CHANNELS_ROOT / f"telegram-{channel}",
-        GLOBAL_REF_DIR,
-    ]
+    if not voice_or_channel or voice_or_channel == "default":
+        wav = GLOBAL_REF_DIR / "reference.wav"
+        if wav.exists():
+            txt = GLOBAL_REF_DIR / "reference.txt"
+            text = txt.read_text(encoding="utf-8").strip() if txt.exists() else None
+            if not (need_text and text is None):
+                return wav, text
+        return None
+
+    # 1. Direct clip in Pulse voices: ~/.pulse/voices/<name>.wav
+    if PULSE_VOICES_DIR.exists():
+        direct_wav = PULSE_VOICES_DIR / f"{voice_or_channel}.wav"
+        if direct_wav.exists():
+            txt = PULSE_VOICES_DIR / f"{voice_or_channel}.txt"
+            text = txt.read_text(encoding="utf-8").strip() if txt.exists() else None
+            if not (need_text and text is None):
+                return direct_wav, text
+
+    # 2. Directory-based candidates
+    candidates = []
+    if PULSE_VOICES_DIR.exists():
+        candidates.append(PULSE_VOICES_DIR / voice_or_channel)
+    candidates.append(CHANNELS_ROOT / f"telegram-{voice_or_channel}")
+    if voice_or_channel.startswith("telegram-"):
+        candidates.append(CHANNELS_ROOT / voice_or_channel)
+    candidates.append(CHANNELS_ROOT / voice_or_channel)
+
     for base in candidates:
         wav = base / "reference.wav"
         txt = base / "reference.txt"
@@ -295,13 +320,22 @@ def resolve_reference(channel: str, need_text: bool) -> tuple[Path, str | None] 
             log.warning(f"{wav} has no usable reference.txt; engine requires one")
             continue
         return wav, text
+
+    # Explicit voice requested but not found anywhere: DO NOT fall back!
     return None
 
 
-def load_channel_config(channel: str) -> dict:
+def load_channel_config(channel: str | None) -> dict:
     """Read global tts.json then <channel-dir>/tts.json. Returns merged dict."""
     merged: dict = {}
-    for base in (GLOBAL_REF_DIR, CHANNELS_ROOT / f"telegram-{channel}"):
+    bases = [GLOBAL_REF_DIR]
+    if channel:
+        bases.extend([
+            CHANNELS_ROOT / f"telegram-{channel}",
+            CHANNELS_ROOT / channel,
+            PULSE_VOICES_DIR / channel,
+        ])
+    for base in bases:
         cfg_path = base / "tts.json"
         if not cfg_path.exists():
             continue
@@ -312,6 +346,31 @@ def load_channel_config(channel: str) -> dict:
         except Exception as err:
             log.warning(f"failed parsing {cfg_path}: {err}")
     return merged
+
+
+def apply_output_sr(samples, sr: int):
+    """Optionally resample the output to TG_RELAY_TTS_OUTPUT_SR.
+
+    Diagnostic, off by default. Both engines emit 24 kHz, which is a perfectly
+    normal rate for speech, and every consumer here has handled it for months.
+    It exists because Pulse's iOS client plays this audio through an
+    AVAudioEngine graph wired at the *clip's* format, with an
+    AVAudioUnitTimePitch in the chain, and hands it to hardware that runs at
+    48 kHz. A rate mismatch across that boundary is the classic cause of
+    audio that plays back pitch-shifted and slurred, which is exactly what
+    Pulse is doing while the identical bytes play clean everywhere else.
+
+    Setting this to 48000 makes the server hand Pulse its native rate, which
+    either fixes it — confirming the diagnosis and pointing the real fix at
+    the client's graph — or does not, which rules the theory out for the cost
+    of one retry. Either outcome is worth more than more reading.
+    """
+    target = int(os.environ.get("TG_RELAY_TTS_OUTPUT_SR", "0"))
+    if target <= 0 or target == sr:
+        return samples, sr
+    import librosa
+
+    return librosa.resample(samples, orig_sr=sr, target_sr=target), target
 
 
 def apply_speed(samples, sr: int, speed: float):
@@ -342,7 +401,8 @@ app = FastAPI(title="tg-relay-tts")
 
 class SynthesizeRequest(BaseModel):
     text: str
-    channel: str
+    channel: str | None = None
+    voice: str | None = None
     # F5-era knobs. nfe_step is meaningless to chatterbox but is still accepted
     # so existing callers do not start failing validation mid-upgrade.
     nfe_step: int | None = None
@@ -367,6 +427,26 @@ def health():
         }
 
 
+@app.get("/voices")
+def list_voices():
+    """List available voices discovered from ~/.pulse/voices and ~/.claude/channels."""
+    voices: set[str] = set()
+    if PULSE_VOICES_DIR.exists():
+        for p in PULSE_VOICES_DIR.glob("*.wav"):
+            voices.add(p.stem)
+        for p in PULSE_VOICES_DIR.iterdir():
+            if p.is_dir() and (p / "reference.wav").exists():
+                voices.add(p.name)
+    if CHANNELS_ROOT.exists():
+        for p in CHANNELS_ROOT.iterdir():
+            if p.is_dir() and (p / "reference.wav").exists():
+                name = p.name
+                if name.startswith("telegram-"):
+                    name = name[len("telegram-"):]
+                voices.add(name)
+    return {"voices": sorted(voices)}
+
+
 @app.post("/synthesize")
 def synthesize(req: SynthesizeRequest):
     global _last_used
@@ -374,22 +454,22 @@ def synthesize(req: SynthesizeRequest):
     if not req.text.strip():
         raise HTTPException(400, "text must not be empty")
 
-    ref = resolve_reference(req.channel, need_text=_engine.needs_ref_text)
+    voice_key = req.voice or req.channel
+    ref = resolve_reference(voice_key, need_text=_engine.needs_ref_text)
     if ref is None:
-        log.info(f"no usable reference audio for channel={req.channel}")
+        log.warning(f"no usable reference audio for voice={voice_key!r}")
         return JSONResponse(
             status_code=404,
             content={
-                "error": f"no reference.wav for channel '{req.channel}' "
-                f"(and no global fallback)"
+                "error": f"no reference audio for voice '{voice_key}'"
             },
         )
 
     ref_audio, ref_text = ref
-    cfg = load_channel_config(req.channel)
+    cfg = load_channel_config(voice_key)
     speed = float(_pick(req.speed, cfg.get("speed"), 1.0))
     log.info(
-        f"synthesize engine={_engine.name} channel={req.channel} "
+        f"synthesize engine={_engine.name} voice={voice_key} "
         f"speed={speed} text={req.text[:60]!r}"
     )
 
@@ -403,6 +483,7 @@ def synthesize(req: SynthesizeRequest):
             # post-hoc stretch.
             if engine.name != "f5":
                 samples = apply_speed(samples, sr, speed)
+            samples, sr = apply_output_sr(samples, sr)
         except Exception as err:
             log.exception("synthesis failed")
             raise HTTPException(500, f"synthesis failed: {err}")
