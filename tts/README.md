@@ -166,7 +166,7 @@ a specific channel:
 
 | Key | Type | Engine | Effect |
 |-----|------|--------|--------|
-| `speed` | float | both | Pace. `1.0` = native, `0.8` = slower, `1.15` = faster. |
+| `speed` | float | both | Pace. `1.0` = native. **Keep it at `1.0` on chatterbox** — see the warning below. |
 | `nfe_step` | int | f5 | Diffusion steps. Ignored by chatterbox. |
 | `exaggeration` | float | chatterbox | Emotional intensity. Default `0.0`. |
 | `cfg_weight` | float | chatterbox | Classifier-free guidance. Default `0.0`. |
@@ -175,6 +175,16 @@ a specific channel:
 F5 applies `speed` during inference. Chatterbox has no speed parameter, so the
 server time-stretches the output afterwards (pitch preserved) to mean the same
 thing under either engine — verified to within 0.1% on a synthetic signal.
+
+> **Leave `speed` at `1.0` under chatterbox.** The stretch is a phase vocoder,
+> and on this model's output anything off `1.0` sounds, in Mark's words,
+> "demonic" — 0.8 was audibly bad, not subtly worse. Exactly `1.0`
+> short-circuits and returns the samples untouched, so the default path never
+> goes through the vocoder at all. The knob exists because callers and existing
+> config files send it and must not start erroring; it is not a knob to tune.
+> If a slower delivery is genuinely wanted, reach for `exaggeration` and
+> punctuation in the text instead. Under `f5` it remained fine, because there
+> the model applies it during inference rather than after.
 
 A `~/.cache/tg-relay-tts/tts.json` works the same way as a global fallback.
 Per-channel keys override global keys. The sidecar re-reads these files on every

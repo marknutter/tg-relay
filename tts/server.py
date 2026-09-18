@@ -321,6 +321,12 @@ def apply_speed(samples, sr: int, speed: float):
     F5 days and callers still send it, so the knob is honoured here instead.
     Matches F5's semantics so a config file means the same thing under either
     engine. Exactly 1.0 short-circuits, so the default path pays nothing.
+
+    CAUTION: this exists for compatibility, not for tuning. A phase vocoder on
+    this model's output sounds badly artificial off 1.0 — 0.8, carried over
+    from the F5 config, was rejected on listening as "demonic" rather than
+    merely slow. The short-circuit is therefore the path essentially everyone
+    should be on. Want a slower delivery? Use exaggeration and punctuation.
     """
     if abs(speed - 1.0) < 1e-3:
         return samples
