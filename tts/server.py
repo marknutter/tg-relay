@@ -120,6 +120,13 @@ class ChatterboxEngine:
     def load(self):
         if self._model is not None:
             return
+        # Chatterbox draws tqdm progress bars from inside generate() with no
+        # option to pass them a sink. stdout is the service log, and tqdm
+        # redraws with carriage returns, so every synth appends a single
+        # enormous line of repainted bar frames — the log grew megabytes a day.
+        # Must be set before tqdm is first imported.
+        os.environ.setdefault("TQDM_DISABLE", "1")
+
         import torch  # heavy; deferred to first synth
         from chatterbox.tts_turbo import ChatterboxTurboTTS
 
