@@ -182,11 +182,23 @@ class ChatterboxEngine:
         import torch  # heavy; deferred to first synth
         from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        requested_device = os.environ.get("TG_RELAY_TTS_DEVICE")
+        device = requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
         log.info(f"loading Chatterbox Turbo on {device}")
         t0 = time.time()
-        self._model = ChatterboxTurboTTS.from_pretrained(device=device)
-        self.device = device
+        try:
+            self._model = ChatterboxTurboTTS.from_pretrained(device=device)
+            self.device = device
+        except Exception as e:
+            if device == "cuda" and not requested_device:
+                log.warning(f"failed to load Chatterbox Turbo on cuda ({e}), falling back to cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                device = "cpu"
+                self._model = ChatterboxTurboTTS.from_pretrained(device=device)
+                self.device = device
+            else:
+                raise
         log.info(f"model loaded in {time.time() - t0:.1f}s, sr={self._model.sr}")
 
     def synth(self, text, ref_audio, ref_text, cfg, req):
