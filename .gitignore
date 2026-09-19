@@ -3,6 +3,7 @@ dist/
 .env
 *.log
 tts/.venv/
+tts/.venv-chatterbox/
 tts/__pycache__/
 **/*.pyc
 .claude/settings.local.json

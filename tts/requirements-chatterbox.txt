@@ -1,0 +1,24 @@
+# Chatterbox Turbo engine (default). Installed into tts/.venv-chatterbox.
+#
+# Kept separate from requirements.txt because chatterbox-tts hard-pins
+# torch==2.6.0 while the F5 install is on torch 2.13.0+cu130. The two engines
+# cannot share a virtualenv; the systemd unit selects the interpreter that
+# matches TG_RELAY_TTS_ENGINE.
+chatterbox-tts==0.1.7
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+soundfile==0.14.0
+
+# NOT optional, and not pulled in by chatterbox-tts.
+#
+# resemble-perth (the watermarker chatterbox applies to every output) imports
+# pkg_resources, which ships in setuptools and is absent from a bare uv venv.
+# The failure is silent and misleading: perth/__init__.py swallows the
+# ImportError and sets PerthImplicitWatermarker = None, so the model downloads
+# and loads fine and then dies at the very end of construction with
+# "TypeError: 'NoneType' object is not callable" — which reads like a bug in
+# chatterbox, not a missing dependency.
+#
+# Pinned below 81 because setuptools 81+ deprecates pkg_resources and has it
+# slated for removal; when perth stops using it this pin can go.
+setuptools<81
