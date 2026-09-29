@@ -201,7 +201,70 @@ class ChatterboxEngine:
                 raise
         log.info(f"model loaded in {time.time() - t0:.1f}s, sr={self._model.sr}")
 
+    # When the card runs out of memory mid-request, which happens when something else has taken
+    # it (a training job, a game), load() having succeeded on cuda does not help: the request fails
+    # and the listener hears nothing. So synth() retries on the CPU, slower by a few seconds but in
+    # the same voice, and stays there until the card has room again.
+    CUDA_RETRY_SECS = 300
+    CUDA_FREE_NEEDED = 4 << 30
+
+    def _to_cpu(self, why):
+        import gc
+        import torch
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        log.warning(f"synthesis ran out of GPU memory ({why}); reloading Chatterbox Turbo on cpu")
+        self._model = None
+        self._conds_key = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        t0 = time.time()
+        self._model = ChatterboxTurboTTS.from_pretrained(device="cpu")
+        self.device = "cpu"
+        self._fell_back_at = time.time()
+        log.info(f"model reloaded on cpu in {time.time() - t0:.1f}s")
+
+    def _maybe_back_to_cuda(self):
+        """Back onto the card once it has room, checked at most every CUDA_RETRY_SECS."""
+        import gc
+        import torch
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        since = getattr(self, "_fell_back_at", None)
+        if self.device != "cpu" or since is None or time.time() - since < self.CUDA_RETRY_SECS:
+            return
+        self._fell_back_at = time.time()
+        if not torch.cuda.is_available():
+            return
+        free, _ = torch.cuda.mem_get_info()
+        if free < self.CUDA_FREE_NEEDED:
+            log.info(f"still on cpu: {free >> 20} MiB free on the card, need {self.CUDA_FREE_NEEDED >> 20}")
+            return
+        log.info(f"{free >> 20} MiB free on the card; moving Chatterbox Turbo back to cuda")
+        try:
+            model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+        except Exception as e:
+            log.warning(f"could not move back to cuda ({e}); staying on cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            return
+        self._model = model
+        self._conds_key = None
+        self.device = "cuda"
+        self._fell_back_at = None
+
     def synth(self, text, ref_audio, ref_text, cfg, req):
+        self._maybe_back_to_cuda()
+        try:
+            return self._synth(text, ref_audio, ref_text, cfg, req)
+        except Exception as e:
+            out_of_memory = "out of memory" in str(e).lower()
+            if self.device != "cuda" or not out_of_memory or os.environ.get("TG_RELAY_TTS_DEVICE"):
+                raise
+            self._to_cpu(e)
+            return self._synth(text, ref_audio, ref_text, cfg, req)
+
+    def _synth(self, text, ref_audio, ref_text, cfg, req):
         exaggeration = _pick(req.exaggeration, cfg.get("exaggeration"), DEFAULT_EXAGGERATION)
         cfg_weight = _pick(req.cfg_weight, cfg.get("cfg_weight"), DEFAULT_CFG_WEIGHT)
         temperature = _pick(req.temperature, cfg.get("temperature"), DEFAULT_TEMPERATURE)
