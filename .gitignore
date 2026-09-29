@@ -2,9 +2,6 @@ node_modules
 dist/
 .env
 *.log
-tts/.venv/
-tts/.venv-chatterbox/
-tts/__pycache__/
 **/*.pyc
 .claude/settings.local.json
 # Per-machine dev MCP config — the plugin runs via the hijacked built-in

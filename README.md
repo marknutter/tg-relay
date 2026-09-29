@@ -36,7 +36,10 @@ Phone → Telegram → Bot API → daemon (launchd, always running)
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
   ```
   When configured, inbound Telegram voice notes are auto-transcribed and delivered as text. Without these tools, voice notes arrive as `(voice message)` placeholder with an `attachment_file_id` that Claude can download but not listen to.
-- **Optional** (for voice-reply from Claude via a cloned voice): a separate Python sidecar at [`tts/`](tts/README.md). See that directory's README for setup. The core daemon works without it — voice replies gracefully fall back to text.
+- **Optional** (for voice-reply from Claude via a cloned voice): a separate service,
+  [`tg-relay-tts`](https://github.com/marknutter/tg-relay-tts) — extracted out of this repo on
+  2026-09-29 (#105) since it's also used independently by Pulse. See that repo's README for
+  setup. The core daemon works without it — voice replies gracefully fall back to text.
 
 ## Setup
 
